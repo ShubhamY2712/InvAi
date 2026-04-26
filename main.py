@@ -24,8 +24,8 @@ class InventoryItem(SQLModel, table=True):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # DEVELOPMENT ONLY: Wipes the old table to build the new advanced architecture
-    SQLModel.metadata.drop_all(engine)
+    # This will only create tables IF they don't already exist.
+    # It will NOT delete existing data.
     SQLModel.metadata.create_all(engine)
     yield
 
@@ -113,4 +113,38 @@ def unpack_parent_item(child_id: int):
             "message": f"Successfully unpacked 1 unit of {parent_item.name}.",
             "new_parent_stock": parent_item.quantity,
             "new_child_stock": child_item.quantity
+        }
+    
+    # 8. NEW: Point of Sale (POS) Logic
+@app.post("/sell-item/{item_id}")
+def sell_item(item_id: int, quantity_sold: float):
+    with Session(engine) as session:
+        item = session.get(InventoryItem, item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        if item.quantity < quantity_sold:
+            # Check if this is a loose item that COULD be restocked from a parent
+            if item.is_loose_item and item.parent_id:
+                parent = session.get(InventoryItem, item.parent_id)
+                if parent and parent.quantity > 0:
+                    return {
+                        "success": False,
+                        "error": "INSUFFICIENT_STOCK_BUT_UNPACK_AVAILABLE",
+                        "message": f"Only {item.quantity}kg left in bin. You have {parent.quantity} sacks in back room. Unpack one?",
+                        "parent_id": item.parent_id
+                    }
+            
+            raise HTTPException(status_code=400, detail="Not enough stock to complete sale")
+
+        # Deduct the sale
+        item.quantity -= quantity_sold
+        session.add(item)
+        session.commit()
+        session.refresh(item)
+
+        return {
+            "success": True,
+            "message": f"Sold {quantity_sold} of {item.name}",
+            "remaining_stock": item.quantity
         }
