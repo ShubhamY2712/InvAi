@@ -30,7 +30,7 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 
 ## 🤝 Let's Connect
 
-$$\large \mathbf{\color{#39D353}{Architected\ &\ Developed\ by\ Shubham\ Yawalkar}}$$
+<img src="https://readme-typing-svg.herokuapp.com/?font=Fira+Code&weight=700&size=25&pause=1000&color=39D353&width=550&lines=Architected+%26+Developed+by+Shubham+Yawalkar" alt="Architected & Developed by Shubham Yawalkar" />
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/shubham-yawalkar/)
 
