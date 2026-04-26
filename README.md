@@ -11,22 +11,27 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 * **Predictive Demand Sensing:** Processes massive datasets using **Polars** and leverages **XGBoost** and **Prophet** for highly accurate time-series forecasting and scenario planning.
 * **Enterprise Multi-Tenancy:** Secure data isolation achieved via **PostgreSQL Row-Level Security (RLS)**, with dynamic feature flagging managed by LaunchDarkly/PostHog.
 
-## 💻 Comprehensive Tech Stack
+## 💻 Tech Stack
 
-### AI & Machine Learning
-* **Generative & Agentic AI:** Llama 3 (LoRA Fine-Tuned), LangChain, LangGraph, vLLM / Ollama
-* **Predictive Data Science:** Polars, XGBoost, Prophet, MLflow, Scikit-learn
-* **Vector Storage:** Pinecone / pgvector
+### 🧠 AI, Machine Learning & Orchestration
+![Python](https://img.shields.io/badge/python-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)
+![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white)
+![Scikit-Learn](https://img.shields.io/badge/scikit--learn-%23F7931E.svg?style=for-the-badge&logo=scikit-learn&logoColor=white)
+![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-yellow?style=for-the-badge)
+![LangChain](https://img.shields.io/badge/🔗_LangChain-white?style=for-the-badge)
 
-### Backend & Infrastructure
-* **Core API:** FastAPI (Python 3.x)
-* **Databases & Caching:** PostgreSQL (RLS), Redis
-* **Task Queues:** Celery, RabbitMQ
-* **DevOps & Cloud:** Docker, Kubernetes, AWS / GCP
+### ⚙️ Backend & Infrastructure
+![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)
+![PostgreSQL](https://img.shields.io/badge/postgres-%23316192.svg?style=for-the-badge&logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/redis-%23DD0031.svg?style=for-the-badge&logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)
+![Kubernetes](https://img.shields.io/badge/kubernetes-%23326ce5.svg?style=for-the-badge&logo=kubernetes&logoColor=white)
+![AWS](https://img.shields.io/badge/AWS-%23FF9900.svg?style=for-the-badge&logo=amazon-aws&logoColor=white)
 
-### Frontend Web & Mobile
-* **Framework:** Next.js (React), Zustand
-* **Hardware Integration:** HTML5 getUserMedia API (Mobile browser barcode scanning)
+### 🌐 Frontend & State Management
+![Next JS](https://img.shields.io/badge/Next-black?style=for-the-badge&logo=next.js&logoColor=white)
+![React](https://img.shields.io/badge/react-%2320232b.svg?style=for-the-badge&logo=react&logoColor=%2361DAFB)
+![Redux](https://img.shields.io/badge/redux-%23593d88.svg?style=for-the-badge&logo=redux&logoColor=white)
 
 <br>
 
