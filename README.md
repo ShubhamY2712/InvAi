@@ -29,7 +29,8 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 * **Hardware Integration:** HTML5 getUserMedia API (Mobile browser barcode scanning)
 
 ## 🤝 Let's Connect
-Architected and developed by **Shubham Yawalkar**.
+
+![Architected By](https://img.shields.io/badge/Architected_&_Developed_By-Shubham_Yawalkar-39D353?style=for-the-badge)
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/shubham-yawalkar/)
 
