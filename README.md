@@ -28,7 +28,7 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 * **Framework:** Next.js (React), Zustand
 * **Hardware Integration:** HTML5 getUserMedia API (Mobile browser barcode scanning)
 
-#### 🤝 Let's Connect
+<br>
 
 <img src="https://readme-typing-svg.herokuapp.com/?font=Fira+Code&weight=700&size=25&pause=1000&color=39D353&width=800&repeat=false&lines=Architected+%26+Developed+by+Shubham+Yawalkar" alt="Architected & Developed by Shubham Yawalkar" />
 
