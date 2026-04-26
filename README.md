@@ -28,9 +28,9 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 * **Framework:** Next.js (React), Zustand
 * **Hardware Integration:** HTML5 getUserMedia API (Mobile browser barcode scanning)
 
-🤝 Let's Connect
-Architected and developed by Shubham Yawalkar.
+## 🤝 Let's Connect
+Architected and developed by **Shubham Yawalkar**.
 
-LinkedIn Profile: https://www.linkedin.com/in/shubham-yawalkar/
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/shubham-yawalkar/)
 
-Open to AI Engineering and Data Science internship opportunities.
+* Open to AI Engineering and Data Science internship opportunities.
