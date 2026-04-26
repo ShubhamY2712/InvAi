@@ -4,10 +4,6 @@
 
 InvAi is a multi-tenant web platform designed to democratize advanced supply chain analytics. It bridges the gap between sophisticated ML demand sensing and Generative AI, utilizing a custom-trained LLM Co-Pilot and autonomous AI agents to manage inventory, forecast stockouts, and trigger vendor reordering workflows.
 
-## 🚀 Current Status
-- **Version 1:** Core FastAPI backend, Next.js interface, and primary ML demand sensing (XGBoost/Prophet) active.
-- **Version 2:** Active development. Integrating LangGraph for autonomous agentic actions and fine-tuning Llama 3 via LoRA for localized inventory intelligence.
-
 ## 🏗️ Core Architecture & Capabilities
 
 * **Agentic Orchestration:** Utilizes **LangGraph** and **LangChain** to create autonomous AI agents capable of multi-step reasoning, such as detecting stock anomalies and drafting automated supplier restock emails.
@@ -38,6 +34,3 @@ Architected and developed by Shubham Yawalkar.
 LinkedIn Profile: https://www.linkedin.com/in/shubham-yawalkar/
 
 Open to AI Engineering and Data Science internship opportunities.
-   ```bash
-   git clone [https://github.com/YourUsername/InvAi.git](https://github.com/YourUsername/InvAi.git)
-   cd InvAi
