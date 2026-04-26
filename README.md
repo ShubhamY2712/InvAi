@@ -28,12 +28,24 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 * **Framework:** Next.js (React), Zustand
 * **Hardware Integration:** HTML5 getUserMedia API (Mobile browser barcode scanning)
 
-## 🤝 Let's Connect
+#### 🤝 Let's Connect
 
 <img src="https://readme-typing-svg.herokuapp.com/?font=Fira+Code&weight=700&size=25&pause=1000&color=39D353&width=800&repeat=false&lines=Architected+%26+Developed+by+Shubham+Yawalkar" alt="Architected & Developed by Shubham Yawalkar" />
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/shubham-yawalkar/) **Let’s connect!**
+<table>
+  <tr>
+    <td valign="center">
+      <a href="https://www.linkedin.com/in/shubham-yawalkar/">
+        <img src="https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white" />
+      </a>
+    </td>
+    <td valign="center">
+      <b>Let's connect! Click to visit my profile.</b>
+    </td>
+  </tr>
+</table>
 
-![Internship Status](https://img.shields.io/badge/STATUS-OPEN_TO_AI_&_DS_INTERNSHIPS-FF0000?style=for-the-badge&labelColor=000000)
+$$\large \mathbf{\color{#FF0000}{OPEN\ TO\ AI\ \&\ DS\ INTERNSHIPS}}$$
+
 
 
