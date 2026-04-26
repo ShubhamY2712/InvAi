@@ -32,6 +32,8 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 
 <img src="https://readme-typing-svg.herokuapp.com/?font=Fira+Code&weight=700&size=25&pause=1000&color=39D353&width=800&repeat=false&lines=Architected+%26+Developed+by+Shubham+Yawalkar" alt="Architected & Developed by Shubham Yawalkar" />
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/shubham-yawalkar/)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/shubham-yawalkar/) **Let’s connect!**
 
-* Open to AI Engineering and Data Science internship opportunities.
+![Internship Status](https://img.shields.io/badge/STATUS-OPEN_TO_AI_&_DS_INTERNSHIPS-FF0000?style=for-the-badge&labelColor=000000)
+
+
