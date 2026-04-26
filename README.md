@@ -18,6 +18,7 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 ![Zustand](https://img.shields.io/badge/Zustand-orange?style=for-the-badge)
 ![Redux](https://img.shields.io/badge/redux-%23593d88.svg?style=for-the-badge&logo=redux&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)
+![PostHog](https://img.shields.io/badge/PostHog-black?style=for-the-badge&logo=posthog)
 ![Celery](https://img.shields.io/badge/Celery-37814A?style=for-the-badge&logo=celery&logoColor=white)
 ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-FF6600?style=for-the-badge&logo=rabbitmq&logoColor=white)
 
@@ -26,12 +27,14 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
 ![Scikit-Learn](https://img.shields.io/badge/scikit--learn-%23F7931E.svg?style=for-the-badge&logo=scikit-learn&logoColor=white)
 ![XGBoost](https://img.shields.io/badge/XGBoost-black?style=for-the-badge)
 ![MLflow](https://img.shields.io/badge/MLflow-0194E2?style=for-the-badge&logo=mlflow&logoColor=white)
+![Prophet](https://img.shields.io/badge/Prophet-white?style=for-the-badge&logo=meta)
 
 ### 🤖 Generative & Agentic AI
 ![Llama 3](https://img.shields.io/badge/Llama_3-04100b?style=for-the-badge&logo=meta)
 ![LangChain](https://img.shields.io/badge/🔗_LangChain-white?style=for-the-badge)
 ![LangGraph](https://img.shields.io/badge/LangGraph-232F3E?style=for-the-badge)
 ![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-yellow?style=for-the-badge)
+![vLLM](https://img.shields.io/badge/vLLM-blue?style=for-the-badge)
 
 ### 🗄️ Database & Cloud Ops
 ![PostgreSQL](https://img.shields.io/badge/postgres-%23316192.svg?style=for-the-badge&logo=postgresql&logoColor=white)
