@@ -44,6 +44,7 @@ InvAi is a multi-tenant web platform designed to democratize advanced supply cha
     </td>
   </tr>
 </table>
+<br>
 
 $\color{red}{\Large\textbf{OPEN TO AI AND DATA SCIENCE INTERNSHIPS}}$
 
