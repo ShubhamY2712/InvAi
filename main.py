@@ -5,102 +5,112 @@ import os
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
-# Load the secret connection string from the .env file
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Create the Engine (The bridge to Neon PostgreSQL)
 engine = create_engine(DATABASE_URL, echo=True)
 
-# 1. Define the Database Table
+# 1. UPGRADED DATABASE SCHEMA (Enterprise Parent-Child Architecture)
 class InventoryItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     price: float
-    quantity: int
+    quantity: float  # Changed to float to support 1.5kg etc.
     barcode: Optional[str] = None
     is_loose_item: bool = False
+    
+    # NEW: Parent-Child Linkage
+    parent_id: Optional[int] = Field(default=None, foreign_key="inventoryitem.id")
+    units_per_parent: Optional[float] = None  # e.g., 50 (if 1 sack = 50kg)
 
-# 2. Tell FastAPI to create the tables when the server starts
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # DEVELOPMENT ONLY: Wipes the old table to build the new advanced architecture
+    SQLModel.metadata.drop_all(engine)
     SQLModel.metadata.create_all(engine)
     yield
 
-# Initialize the InvAi application with the lifespan manager
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def health_check():
-    return {
-        "system": "InvAi Backend",
-        "status": "Online and Connected to Cloud DB",
-    }
+    return {"system": "InvAi Backend", "status": "V2 Architecture Online"}
 
-# 3. Upgraded POST endpoint to save data permanently
 @app.post("/add-item/")
 def add_item(item: InventoryItem):
-    # Open a session with the database, add the item, and commit (save) it
     with Session(engine) as session:
         session.add(item)
         session.commit()
-        session.refresh(item) # Retrieves the newly generated ID from the database
-        
-        return {
-            "success": True,
-            "message": f"{item.name} has been securely saved to the database!",
-            "data": item
-        }
-    
-    # 4. NEW: Endpoint to fetch all inventory items
+        session.refresh(item)
+        return {"success": True, "message": "Saved to V2 Database", "data": item}
+
 @app.get("/items/")
 def get_all_items():
     with Session(engine) as session:
-        # Fetch every row from the InventoryItem table
         items = session.exec(select(InventoryItem)).all()
-        return {
-            "success": True,
-            "total_items": len(items),
-            "data": items
-        }
-    
-    # 5. NEW: Update an existing item (e.g., when a sale happens and stock drops)
+        return {"success": True, "total_items": len(items), "data": items}
+
 @app.put("/items/{item_id}")
 def update_item(item_id: int, updated_data: InventoryItem):
     with Session(engine) as session:
-        # Find the specific item in the database
         db_item = session.get(InventoryItem, item_id)
         if not db_item:
-            raise HTTPException(status_code=404, detail="Item not found in inventory")
+            raise HTTPException(status_code=404, detail="Item not found")
         
-        # Update the data
         db_item.name = updated_data.name
         db_item.price = updated_data.price
         db_item.quantity = updated_data.quantity
         db_item.barcode = updated_data.barcode
         db_item.is_loose_item = updated_data.is_loose_item
+        db_item.parent_id = updated_data.parent_id
+        db_item.units_per_parent = updated_data.units_per_parent
         
-        # Save the changes permanently
         session.add(db_item)
         session.commit()
         session.refresh(db_item)
-        
-        return {
-            "success": True, 
-            "message": f"Item {item_id} successfully updated.", 
-            "data": db_item
-        }
+        return {"success": True, "data": db_item}
 
-# 6. NEW: Delete an item (e.g., shop stops selling a product)
 @app.delete("/items/{item_id}")
 def delete_item(item_id: int):
     with Session(engine) as session:
         db_item = session.get(InventoryItem, item_id)
         if not db_item:
-            raise HTTPException(status_code=404, detail="Item not found in inventory")
-        
-        # Erase the item from the database
+            raise HTTPException(status_code=404, detail="Item not found")
         session.delete(db_item)
         session.commit()
+        return {"success": True, "message": f"Item {item_id} deleted."}
+
+        # 7. NEW: Enterprise "Unpack" Logic (Atomic Transaction)
+@app.post("/unpack/{child_id}")
+def unpack_parent_item(child_id: int):
+    with Session(engine) as session:
+        # 1. Find the loose item (Child)
+        child_item = session.get(InventoryItem, child_id)
+        if not child_item or not child_item.parent_id:
+            raise HTTPException(status_code=400, detail="Item is not a valid child item.")
+            
+        # 2. Find the bulk item (Parent)
+        parent_item = session.get(InventoryItem, child_item.parent_id)
+        if not parent_item:
+            raise HTTPException(status_code=404, detail="Parent bulk item not found.")
+            
+        # 3. Check if we actually have sacks left to unpack
+        if parent_item.quantity < 1:
+            raise HTTPException(status_code=400, detail=f"Not enough {parent_item.name} to unpack!")
+            
+        # 4. THE ATOMIC MATH: Deduct 1 sack, add the loose units
+        parent_item.quantity -= 1
+        child_item.quantity += child_item.units_per_parent
         
-        return {"success": True, "message": f"Item {item_id} has been permanently deleted."}
+        # 5. Save BOTH changes simultaneously
+        session.add(parent_item)
+        session.add(child_item)
+        session.commit()
+        session.refresh(parent_item)
+        session.refresh(child_item)
+        
+        return {
+            "success": True,
+            "message": f"Successfully unpacked 1 unit of {parent_item.name}.",
+            "new_parent_stock": parent_item.quantity,
+            "new_child_stock": child_item.quantity
+        }
