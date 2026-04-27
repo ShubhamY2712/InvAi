@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from typing import Optional, List
 import os
@@ -6,10 +7,47 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
 from datetime import date, timedelta
+import bcrypt
+from datetime import datetime, timedelta, timezone
+from jose import jwt
+
+# --- JWT CONFIGURATION ---
+SECRET_KEY = "invai_super_secret_dev_key_123!" # Never share this in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 # The user will stay logged in for 1 hour
+
+# --- MODERN SECURITY ENGINE ---
+def get_password_hash(password: str) -> str:
+    """Hashes a password directly using the official bcrypt library."""
+    # 1. Convert the string password to raw bytes
+    pwd_bytes = password.encode('utf-8')
+    # 2. Generate a cryptographic salt and hash the password
+    salt = bcrypt.gensalt()
+    hashed_password = bcrypt.hashpw(pwd_bytes, salt)
+    # 3. Return as a standard string for the database
+    return hashed_password.decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifies a typed password against the database hash."""
+    password_byte_enc = plain_password.encode('utf-8')
+    hashed_password_bytes = hashed_password.encode('utf-8')
+    return bcrypt.checkpw(password_byte_enc, hashed_password_bytes)
+
+def create_access_token(data: dict):
+    """Creates a digitally signed JWT token containing user data."""
+    to_encode = data.copy()
+    
+    # Calculate the exact time the token should expire
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    
+    # Cryptographically sign the token using our SECRET_KEY
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL, echo=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # --- 1. THE SAAS DEFINITIONS (Fixed Categories & Roles) ---
 
@@ -46,6 +84,8 @@ class User(SQLModel, table=True):
     # ID is a String. We will manually construct this (Business ID + Employee Number)
     id: str = Field(primary_key=True) 
     username: str
+    email: str = Field(unique=True, index=True)
+    hashed_password: str
     role: UserRole = UserRole.CASHIER
     business_id: str = Field(foreign_key="businessprofile.id") 
 
@@ -65,11 +105,13 @@ class InventoryItem(SQLModel, table=True):
     expiry_date: Optional[date] = None
 
 
-# --- 3. LIFESPAN ALERTS ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    SQLModel.metadata.drop_all(engine)
-    SQLModel.metadata.create_all(engine)
+    # --- DISARMED THE SLEDGEHAMMER ---
+    #SQLModel.metadata.drop_all(engine)
+    #SQLModel.metadata.create_all(engine)
+    #print("🧨 DATABASE WIPED AND REBUILT 🧨")
+    
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -80,6 +122,8 @@ class OnboardingRequest(SQLModel):
     business_name: str
     category: BusinessCategory
     owner_username: str
+    email: str
+    password: str  
 
 @app.post("/onboard-business/")
 def onboard_new_business(request: OnboardingRequest):
@@ -94,12 +138,16 @@ def onboard_new_business(request: OnboardingRequest):
         # Assemble Owner ID: "BusinessID" + "001" (e.g., 4092001)
         owner_id = f"{new_business.id}001"
         
+        # Create the Owner Profile with a mathematically secured password
         new_user = User(
             id=owner_id,
-            username=request.owner_username,
-            role=UserRole.OWNER,
+            username=request.owner_username, # Fixed: Uses the username from the JSON
+            email=request.email,
+            hashed_password=get_password_hash(request.password), # Fixed: Hashes the actual password!
+            role="Owner",
             business_id=new_business.id
         )
+        
         session.add(new_user)
         session.commit()
         session.refresh(new_business)
@@ -109,6 +157,46 @@ def onboard_new_business(request: OnboardingRequest):
             "success": True,
             "business_id": new_business.id,
             "owner_user_id": new_user.id
+        }
+    
+@app.post("/login/")
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    # We use your existing 'with Session(engine)' pattern here
+    with Session(engine) as session:
+        # 1. Search the database for the username the user typed in
+        statement = select(User).where(User.username == form_data.username)
+        user = session.exec(statement).first()
+
+        # 2. If the user doesn't exist, kick them out
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+        # 3. If the user exists, run their typed password against the database hash
+        is_password_correct = verify_password(form_data.password, user.hashed_password)
+        
+        if not is_password_correct:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+
+       # 4. If everything matches, generate the VIP Wristband (JWT)
+        # We store the user.id as the "sub" (subject) which is standard practice
+        token_payload = {
+            "sub": str(user.id),
+            "business_id": str(user.business_id),
+            "role": user.role
+        }
+        
+        access_token = create_access_token(data=token_payload)
+
+        # 5. Return the token in the exact format standard Next.js frontends expect
+        return {
+            "access_token": access_token,
+            "token_type": "bearer"
         }
     
 
