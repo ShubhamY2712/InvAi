@@ -1,5 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, Header
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from typing import Optional, List
 import os
@@ -9,9 +9,11 @@ from enum import Enum
 from datetime import date, timedelta
 import bcrypt
 from datetime import datetime, timedelta, timezone
-from jose import jwt
+from jose import jwt, JWTError
 
 # --- JWT CONFIGURATION ---
+# --- THE DOOR ---
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 SECRET_KEY = "invai_super_secret_dev_key_123!" # Never share this in production
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 # The user will stay logged in for 1 hour
@@ -44,6 +46,39 @@ def create_access_token(data: dict):
     # Cryptographically sign the token using our SECRET_KEY
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+# --- THE BOUNCER & IDENTITY VERIFIER ---
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    """Verifies the JWT and extracts the user data. Rejects invalid tokens."""
+    
+    # The standard error we throw if the token is fake, expired, or missing
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        # 1. Identity Verification (The Logic): Decode the cryptographic signature
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        # 2. Extract the vital information
+        user_id: str = payload.get("sub")
+        business_id: str = payload.get("business_id")
+        
+        if user_id is None or business_id is None:
+            raise credentials_exception
+            
+        # 3. The Bouncer Opens the Door: Return the verified identity back to the route
+        return {
+            "user_id": user_id, 
+            "business_id": business_id, 
+            "role": payload.get("role")
+        }
+        
+    except JWTError:
+        # If the signature fails or token is expired, kick them out
+        raise credentials_exception
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -323,3 +358,12 @@ def get_expiring_items(
             "alert_count": len(expiring_items),
             "data": expiring_items
         }
+    
+@app.get("/dev/me/")
+def get_my_profile(current_user: dict = Depends(get_current_user)):
+    """A protected route. You can only see this if the Bouncer lets you in."""
+    return {
+        "success": True,
+        "message": "You made it past the bouncer!",
+        "your_secure_data": current_user
+    }
