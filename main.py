@@ -10,6 +10,7 @@ from datetime import date, timedelta
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
+import enum
 
 # --- JWT CONFIGURATION ---
 # --- THE DOOR ---
@@ -95,10 +96,10 @@ class BusinessCategory(str, Enum):
     INDUSTRIAL = "Industrial & Hardware"
     SERVICES = "Service-Based Inventory"
 
-class UserRole(str, Enum):
+class UserRole(str, enum.Enum):
     OWNER = "Owner"
+    STAFF = "Staff"
     MANAGER = "Manager"
-    CASHIER = "Cashier"
 
 
 import random
@@ -116,12 +117,12 @@ class BusinessProfile(SQLModel, table=True):
     category: BusinessCategory
 
 class User(SQLModel, table=True):
-    # ID is a String. We will manually construct this (Business ID + Employee Number)
-    id: str = Field(primary_key=True) 
-    username: str
+    __tablename__ = "users"
+    id: int | None = Field(default=None, primary_key=True) # <--- The DB handles this!
+    username: str = Field(unique=True, index=True)
     email: str = Field(unique=True, index=True)
     hashed_password: str
-    role: UserRole = UserRole.CASHIER
+    role: UserRole = Field(default=UserRole.STAFF)
     business_id: str = Field(foreign_key="businessprofile.id") 
 
 class InventoryItem(SQLModel, table=True):
@@ -153,13 +154,11 @@ class Product(SQLModel, table=True):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- DISARMED THE SLEDGEHAMMER ---
-    #SQLModel.metadata.drop_all(engine)
-    #SQLModel.metadata.create_all(engine)
-    #print("🧨 DATABASE WIPED AND REBUILT 🧨")
-    
+    # SQLModel.metadata.drop_all(engine)   <-- COMMENT THESE OUT
+    # SQLModel.metadata.create_all(engine) <-- COMMENT THESE OUT
+    print("🚀 InvAi Backend is Live and Secure 🚀")
     yield
-
+    
 app = FastAPI(lifespan=lifespan)
 
 # --- 4. FEATURE 1: DYNAMIC ONBOARDING ---
@@ -371,41 +370,52 @@ def delete_product(
     
     # --- 6. FEATURE 2: EMPLOYEE MANAGEMENT (The RBAC Loop) ---
 
-class EmployeeCreateRequest(SQLModel):
+class EmployeeCreate(SQLModel):
     username: str
-    role: UserRole = UserRole.CASHIER  # Defaults to Cashier to prevent accidental admin creation
+    full_name: str
+    email: str
+    password: str # Plain text from the frontend, we will hash it below
+    role: UserRole = UserRole.STAFF
 
-@app.post("/add-employee/")
+@app.post("/employees/")
 def add_employee(
-    request: EmployeeCreateRequest,
-    x_user_id: str = Header(...) # Changed to str
+    employee_data: EmployeeCreate, 
+    current_user: dict = Depends(get_current_user) # THE BOUNCER
 ):
-    with Session(engine) as session:
-        admin_user = session.get(User, x_user_id)
-        if not admin_user or admin_user.role == UserRole.CASHIER:
-            raise HTTPException(status_code=403, detail="Unauthorized")
-            
-        # Count existing users in this business to get the next number
-        existing_users = session.exec(select(User).where(User.business_id == admin_user.business_id)).all()
-        
-        # If there are 3 users, this makes the next string "004"
-        next_employee_number = str(len(existing_users) + 1).zfill(3) 
-        
-        # Assemble the New ID: e.g., "4092004"
-        new_employee_id = f"{admin_user.business_id}{next_employee_number}"
-        
-        new_employee = User(
-            id=new_employee_id,
-            username=request.username,
-            role=request.role,
-            business_id=admin_user.business_id
+    # Optional Security: Only allow 'Owner' to add employees
+    if current_user["role"] != "Owner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Only business owners can add employees."
         )
-        
+
+    with Session(engine) as session:
+        # 1. Check if the username is already taken
+        existing_user = session.exec(select(User).where(User.username == employee_data.username)).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username already exists.")
+
+        # 2. Hash the employee's password before saving
+        hashed_pw = get_password_hash(employee_data.password)
+
+        # 3. Create the new User record linked to the Owner's business_id
+        new_employee = User(
+            username=employee_data.username,
+            hashed_password=hashed_pw,
+            email=employee_data.email,
+            role=employee_data.role,
+            business_id=current_user["business_id"] # SECURE LINKAGE
+        )
+
         session.add(new_employee)
         session.commit()
         session.refresh(new_employee)
-        
-        return {"success": True, "employee_id": new_employee.id}
+
+        return {
+            "success": True,
+            "message": f"Employee {new_employee.username} added to {current_user['business_id']}",
+            "employee_id": new_employee.id
+        }
     
 
   # --- 7. FEATURE 8: EXPIRY MANAGEMENT (The Alarm System) ---
