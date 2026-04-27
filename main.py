@@ -135,6 +135,17 @@ class InventoryItem(SQLModel, table=True):
     units_per_parent: Optional[float] = None
     business_id: str = Field(foreign_key="businessprofile.id")
 
+class Product(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    sku: str = Field(index=True) # Stock Keeping Unit (Barcode equivalent)
+    description: str | None = None
+    price: float
+    quantity: int = Field(default=0)
+    
+    # The crucial multi-tenant lock: This ties the product to a specific business
+    business_id: str = Field(foreign_key="businessprofile.id", index=True)
+
     # --- NEW: FEATURE 8 (EXPIRY MANAGEMENT) ---
     batch_number: Optional[str] = None
     expiry_date: Optional[date] = None
@@ -159,6 +170,19 @@ class OnboardingRequest(SQLModel):
     owner_username: str
     email: str
     password: str  
+
+class ProductCreate(SQLModel):
+    name: str
+    sku: str
+    price: float
+    quantity: int = 0
+    description: str | None = None
+
+class ProductUpdate(SQLModel):
+    # Everything is optional because we only update what the frontend sends
+    quantity: int | None = None
+    price: float | None = None
+    description: str | None = None
 
 @app.post("/onboard-business/")
 def onboard_new_business(request: OnboardingRequest):
@@ -237,48 +261,112 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
     # --- 5. FEATURE 2 & 5: SECURE INVENTORY MANAGEMENT ---
 
-@app.post("/add-item/")
-def add_item(item: InventoryItem, x_user_id: str = Header(...)):
-    """
-    Adds an item, but ONLY if the user is an Owner/Manager.
-    Automatically locks the item to the user's specific business.
-    """
+@app.post("/products/")
+def add_product(
+    product_data: ProductCreate, 
+    current_user: dict = Depends(get_current_user) # The Bouncer checks the token first!
+):
     with Session(engine) as session:
-        # 1. Identity Check
-        user = session.get(User, x_user_id)
-        if not user:
-            raise HTTPException(status_code=401, detail="Unauthorized: User not found.")
-            
-        # 2. RBAC (Role-Based Access Control) Security Gate
-        if user.role == UserRole.CASHIER:
-            raise HTTPException(status_code=403, detail="Forbidden: Cashiers cannot add new inventory types.")
-            
-        # 3. The SaaS Lock: Force the item into the user's business silo
-        item.business_id = user.business_id
+        # Create the database record, combining user data with the Bouncer's secure ID
+        new_product = Product(
+            name=product_data.name,
+            sku=product_data.sku,
+            price=product_data.price,
+            quantity=product_data.quantity,
+            description=product_data.description,
+            business_id=current_user["business_id"] # <-- THE MULTI-TENANT LOCK
+        )
         
-        session.add(item)
+        session.add(new_product)
         session.commit()
-        session.refresh(item)
-        return {"success": True, "message": "Item securely added.", "data": item}
-
-@app.get("/items/")
-def get_all_items(x_user_id: int = Header(...)):
-    """
-    Tenant Isolation: Returns ONLY the items belonging to the user's business.
-    """
-    with Session(engine) as session:
-        user = session.get(User, x_user_id)
-        if not user:
-            raise HTTPException(status_code=401, detail="Unauthorized.")
-            
-        # 4. Data Isolation: Filter the database by business_id
-        items = session.exec(select(InventoryItem).where(InventoryItem.business_id == user.business_id)).all()
+        session.refresh(new_product)
         
         return {
+            "success": True,
+            "message": f"Successfully added {new_product.name} to inventory.",
+            "product": new_product
+        }
+    
+@app.get("/products/")
+def get_inventory(current_user: dict = Depends(get_current_user)):
+    with Session(engine) as session:
+        # The ultimate security filter: ONLY return products matching this user's business_id
+        statement = select(Product).where(Product.business_id == current_user["business_id"])
+        products = session.exec(statement).all()
+        
+        return {
+            "success": True,
+            "total_items": len(products),
+            "inventory": products
+        }
+    
+@app.patch("/products/{product_id}")
+def update_product(
+    product_id: int,
+    product_update: ProductUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    with Session(engine) as session:
+        # 1. The Ultimate Security Check: Find the product, but ONLY if they own it
+        statement = select(Product).where(
+            Product.id == product_id,
+            Product.business_id == current_user["business_id"]
+        )
+        product = session.exec(statement).first()
+
+        # 2. If it doesn't exist (or they don't own it), reject them
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail="Product not found or access denied"
+            )
+
+        # 3. Update only the fields the frontend specifically asked to change
+        if product_update.quantity is not None:
+            product.quantity = product_update.quantity
+        if product_update.price is not None:
+            product.price = product_update.price
+        if product_update.description is not None:
+            product.description = product_update.description
+
+        # 4. Save the changes to the vault
+        session.add(product)
+        session.commit()
+        session.refresh(product)
+
+        return {
+            "success": True,
+            "message": f"Successfully updated {product.name}",
+            "product": product
+        }
+    
+@app.delete("/products/{product_id}")
+def delete_product(
+    product_id: int, 
+    current_user: dict = Depends(get_current_user)
+):
+    with Session(engine) as session:
+        # 1. Search for the product using the ID AND the Business ID (The Multi-Tenant Lock)
+        statement = select(Product).where(
+            Product.id == product_id, 
+            Product.business_id == current_user["business_id"]
+        )
+        product = session.exec(statement).first()
+
+        # 2. If it's not there or belongs to someone else, say it's not found
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail="Product not found or access denied"
+            )
+
+        # 3. Remove it from the database
+        session.delete(product)
+        session.commit()
+
+        return {
             "success": True, 
-            "business_id": user.business_id, 
-            "total_items": len(items), 
-            "data": items
+            "message": f"Product '{product.name}' has been permanently removed from InvAi."
         }
     
     # --- 6. FEATURE 2: EMPLOYEE MANAGEMENT (The RBAC Loop) ---
@@ -367,3 +455,4 @@ def get_my_profile(current_user: dict = Depends(get_current_user)):
         "message": "You made it past the bouncer!",
         "your_secure_data": current_user
     }
+
