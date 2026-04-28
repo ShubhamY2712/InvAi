@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 import enum
 
+
 # --- JWT CONFIGURATION ---
 # --- THE DOOR ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -147,19 +148,51 @@ class Product(SQLModel, table=True):
     # The crucial multi-tenant lock: This ties the product to a specific business
     business_id: str = Field(foreign_key="businessprofile.id", index=True)
 
+
+class Sale(SQLModel, table=True):
+    __tablename__ = "sales"
+    
+    id: int | None = Field(default=None, primary_key=True)
+    product_id: int = Field(index=True) # What was sold
+    user_id: int = Field(index=True)    # Who sold it (Ankit or Rahul)
+    business_id: str = Field(index=True) # Multi-tenant lock
+    quantity: int
+    total_price: float
+    
+    # Automatically stamps the exact millisecond the sale happens
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
     # --- NEW: FEATURE 8 (EXPIRY MANAGEMENT) ---
     batch_number: Optional[str] = None
     expiry_date: Optional[date] = None
 
+class Supplier(SQLModel, table=True):
+    __tablename__ = "suppliers"
+    
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    contact_email: str | None = None
+    phone: str | None = None
+    business_id: str = Field(index=True) # Locks this supplier to FreshMart only
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # SQLModel.metadata.drop_all(engine)   <-- COMMENT THESE OUT
-    # SQLModel.metadata.create_all(engine) <-- COMMENT THESE OUT
-    print("🚀 InvAi Backend is Live and Secure 🚀")
+    # ONLY UNCOMMENT THIS TO BUILD THE NEW TABLES:
+  #  SQLModel.metadata.create_all(engine)
+ #   print("✅ SUPPLIER & PO TABLES SYNCED ✅")
     yield
     
 app = FastAPI(lifespan=lifespan)
+
+@app.get("/reset-po-table")
+def reset_po_table():
+    # This drops ONLY the purchase order table and rebuilds it with the new columns
+    PurchaseOrder.__table__.drop(engine)
+    PurchaseOrder.__table__.create(engine)
+    return {"message": "✅ Purchase Order table upgraded and synced!"}
+
+
 
 # --- 4. FEATURE 1: DYNAMIC ONBOARDING ---
 
@@ -265,6 +298,11 @@ def add_product(
     product_data: ProductCreate, 
     current_user: dict = Depends(get_current_user) # The Bouncer checks the token first!
 ):
+    
+    # SECURITY CHECK
+    if current_user.get("role").lower() not in ["owner", "manager"]:
+        raise HTTPException(status_code=403, detail="Staff cannot create new products.")
+    
     with Session(engine) as session:
         # Create the database record, combining user data with the Bouncer's secure ID
         new_product = Product(
@@ -305,6 +343,11 @@ def update_product(
     product_update: ProductUpdate,
     current_user: dict = Depends(get_current_user)
 ):
+    
+    # SECURITY CHECK
+    if current_user.get("role").lower() not in ["owner", "manager"]:
+        raise HTTPException(status_code=403, detail="Staff cannot edit product details.")
+    
     with Session(engine) as session:
         # 1. The Ultimate Security Check: Find the product, but ONLY if they own it
         statement = select(Product).where(
@@ -344,6 +387,11 @@ def delete_product(
     product_id: int, 
     current_user: dict = Depends(get_current_user)
 ):
+    
+    # SECURITY CHECK
+    if current_user.get("role").lower() != "owner":
+        raise HTTPException(status_code=403, detail="Only the Owner can delete products from the system.")
+    
     with Session(engine) as session:
         # 1. Search for the product using the ID AND the Business ID (The Multi-Tenant Lock)
         statement = select(Product).where(
@@ -466,3 +514,330 @@ def get_my_profile(current_user: dict = Depends(get_current_user)):
         "your_secure_data": current_user
     }
 
+class CheckoutRequest(SQLModel):
+    product_id: int
+    quantity: int
+
+@app.post("/checkout/")
+def process_checkout(
+    request: CheckoutRequest,
+    current_user: dict = Depends(get_current_user)
+):    
+    with Session(engine) as session:
+        
+        # 1. The Bulletproof Primary Key Lookup
+        # We force it to be a string, strip any invisible spaces, then force to integer
+        clean_user_id = int(str(current_user["user_id"]).strip())
+        
+        # session.get() is the safest way to find by ID
+        user = session.get(User, clean_user_id)
+        
+        if not user:
+            raise HTTPException(
+                status_code=401, 
+                detail=f"User ID {clean_user_id} not found."
+            )
+
+        # 2. Find the product (Also stripping the business_id just to be safe!)
+        clean_business_id = str(current_user["business_id"]).strip()
+        
+        statement = select(Product).where(
+            Product.id == request.product_id,
+            Product.business_id == clean_business_id
+        )
+        product = session.exec(statement).first()
+
+        # 3. Validation: Does it exist?
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found in your inventory.")
+
+        # 4. Validation: Do we have enough stock?
+        if product.quantity < request.quantity:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Not enough stock! Only {product.quantity} units of {product.name} left."
+            )
+
+        # 5. Calculate Revenue
+        total_price = product.price * request.quantity
+
+        # 6. Perform the "Atomic" Action: Deduct Stock AND Create Receipt
+        product.quantity -= request.quantity
+        
+        new_sale = Sale(
+            product_id=product.id,
+            user_id=user.id,
+            business_id=clean_business_id,
+            quantity=request.quantity,
+            total_price=total_price
+        )
+        
+        # Add both to the session vault
+        session.add(product)
+        session.add(new_sale)
+
+        # 7. COMMIT!
+        session.commit()
+        session.refresh(product)
+        session.refresh(new_sale)
+
+        return {
+            "success": True,
+            "message": f"Successfully sold {request.quantity}x {product.name}",
+            "revenue": total_price,
+            "stock_remaining": product.quantity,
+            "sale_id": new_sale.id
+        }
+    
+@app.get("/sales/")
+def get_sales_history(current_user: dict = Depends(get_current_user)):
+    with Session(engine) as session:
+        # Clean the token data just like we did in checkout
+        clean_business_id = str(current_user["business_id"]).strip()
+        clean_user_id = int(str(current_user["user_id"]).strip())
+        
+        # Grab the role from the token and ensure it's uppercase
+        role = str(current_user.get("role", "")).upper()
+
+        # The Logic Split: Owner vs Staff
+        if role == "OWNER" or role == "MANAGER":
+            # The Boss sees EVERYTHING for this specific business
+            statement = select(Sale).where(Sale.business_id == clean_business_id)
+        else:
+            # The Staff only sees the sales attached to their specific user_id
+            statement = select(Sale).where(
+                Sale.business_id == clean_business_id,
+                Sale.user_id == clean_user_id
+            )
+        
+        sales = session.exec(statement).all()
+        
+        # Calculate quick analytics for the response
+        total_revenue = sum(sale.total_price for sale in sales)
+        total_items_sold = sum(sale.quantity for sale in sales)
+
+        return {
+            "total_records": len(sales),
+            "total_revenue": total_revenue,
+            "total_items_sold": total_items_sold,
+            "sales_data": sales
+        }
+    
+
+class SupplierCreate(SQLModel):
+    name: str
+    contact_email: str | None = None
+    phone: str | None = None
+
+
+@app.post("/suppliers/")
+def add_supplier(
+    supplier: SupplierCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    with Session(engine) as session:
+        # Clean the business ID from the token for safety
+        clean_business_id = str(current_user["business_id"]).strip()
+
+        # Create the new supplier in the database
+        new_supplier = Supplier(
+            name=supplier.name,
+            contact_email=supplier.contact_email,
+            phone=supplier.phone,
+            business_id=clean_business_id
+        )
+
+        session.add(new_supplier)
+        session.commit()
+        session.refresh(new_supplier)
+
+        return {
+            "success": True, 
+            "message": f"Successfully added vendor: {new_supplier.name}",
+            "supplier_id": new_supplier.id
+        }
+    
+    
+class PurchaseOrderCreate(SQLModel):
+    supplier_id: int
+    product_id: int
+    quantity: int
+    unit_cost: float
+
+class PurchaseOrder(SQLModel, table=True):
+    __tablename__ = "purchase_orders"  
+    
+    id: int | None = Field(default=None, primary_key=True)
+    supplier_id: int = Field(index=True)
+    product_id: int = Field(index=True)
+    business_id: str = Field(index=True)
+    quantity: int
+    unit_cost: float                     
+    total_cost: float                    
+    status: str = Field(default="PENDING") 
+    
+    # --- The 3-Step AI Analytics Timestamps ---
+    timestamp: datetime = Field(default_factory=datetime.utcnow) # Step 1: Placed Order
+    delivered_at: datetime | None = None                         # Step 2: Reached Loading Dock
+    stocked_at: datetime | None = None                           # Step 3: Scanned to Shelf
+
+@app.post("/purchase-orders/")
+def process_purchase_order(
+    request: PurchaseOrderCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    with Session(engine) as session:
+        clean_business_id = str(current_user["business_id"]).strip()
+
+        # 1. Verify the Supplier belongs to this business
+        supplier = session.exec(
+            select(Supplier).where(
+                Supplier.id == request.supplier_id, 
+                Supplier.business_id == clean_business_id
+            )
+        ).first()
+        if not supplier:
+            raise HTTPException(status_code=404, detail="Supplier not found.")
+
+        # 2. Verify the Product belongs to this business
+        product = session.exec(
+            select(Product).where(
+                Product.id == request.product_id, 
+                Product.business_id == clean_business_id
+            )
+        ).first()
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found in inventory.")
+
+        # 3.  PO Receipt 
+        calculated_total_cost = request.quantity * request.unit_cost
+        
+        new_po = PurchaseOrder(
+            supplier_id=supplier.id,
+            product_id=product.id,
+            business_id=clean_business_id,
+            quantity=request.quantity,
+            unit_cost=request.unit_cost,          
+            total_cost=calculated_total_cost,
+            status="PENDING"      # <--- Explicitly mark it as waiting for delivery
+        )
+
+        # Add ONLY the receipt to the vault (Notice we don't add the product anymore)
+        session.add(new_po)
+
+        # 4. COMMIT! 
+        session.commit()
+        session.refresh(new_po)
+
+        return {
+            "success": True,
+            "message": f"Order placed for {request.quantity}x {product.name}. Awaiting delivery.",
+            "current_stock_level": product.quantity,  # Unchanged!
+            "expense": calculated_total_cost,
+            "po_id": new_po.id,
+            "status": new_po.status
+        }
+    
+@app.put("/purchase-orders/{po_id}/deliver")
+def mark_po_delivered(
+    po_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    with Session(engine) as session:
+        clean_business_id = str(current_user["business_id"]).strip()
+        po = session.exec(select(PurchaseOrder).where(PurchaseOrder.id == po_id, PurchaseOrder.business_id == clean_business_id)).first()
+        
+        if not po:
+            raise HTTPException(status_code=404, detail="Purchase Order not found.")
+        if po.status != "PENDING":
+            raise HTTPException(status_code=400, detail=f"Cannot deliver. Order is currently {po.status}")
+
+        po.status = "DELIVERED"
+        po.delivered_at = datetime.utcnow() # Stamps the exact millisecond the truck arrived
+        
+        session.add(po)
+        session.commit()
+        session.refresh(po)
+
+        return {
+            "success": True,
+            "message": "Boxes arrived at the loading dock! Supplier clock stopped. (Inventory NOT updated yet).",
+            "status": po.status
+        }
+
+# --- STEP 3: The Shelf (Scan into Inventory) ---
+# This tracks how fast your staff puts boxes away, and FINALLY adds the stock.
+@app.put("/purchase-orders/{po_id}/stock")
+def stock_po_inventory(
+    po_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    with Session(engine) as session:
+        clean_business_id = str(current_user["business_id"]).strip()
+        po = session.exec(select(PurchaseOrder).where(PurchaseOrder.id == po_id, PurchaseOrder.business_id == clean_business_id)).first()
+        
+        if not po:
+            raise HTTPException(status_code=404, detail="Purchase Order not found.")
+        if po.status != "DELIVERED":
+            raise HTTPException(status_code=400, detail="Boxes must be DELIVERED to the dock before they can be stocked.")
+
+        product = session.exec(select(Product).where(Product.id == po.product_id, Product.business_id == clean_business_id)).first()
+
+        # THE ATOMIC MATH ACTION!
+        po.status = "STOCKED"
+        po.stocked_at = datetime.utcnow() # Stamps the millisecond your staff scanned it
+        product.quantity += po.quantity   
+
+        session.add(po)
+        session.add(product)
+        session.commit()
+        session.refresh(product)
+
+        return {
+            "success": True,
+            "message": f"Successfully scanned! Added {po.quantity} units to the shelf.",
+            "new_stock_level": product.quantity,
+            "status": po.status
+        }
+    
+# --- MANUAL STOCK AUDIT (PROTECTED) ---
+@app.put("/products/{product_id}/manual-audit")
+def manual_stock_adjustment(
+    product_id: int, 
+    new_quantity: int,
+    current_user: dict = Depends(get_current_user)
+):
+    # Updated Security Gate: Owner and Manager only
+    if current_user.get("role") not in ["owner", "manager"]:
+        raise HTTPException(
+            status_code=403, 
+            detail="Access Denied: Only the Owner or a Manager can manually adjust stock levels."
+        )
+
+    with Session(engine) as session:
+        clean_business_id = str(current_user["business_id"]).strip()
+        
+        product = session.exec(
+            select(Product).where(
+                Product.id == product_id, 
+                Product.business_id == clean_business_id
+            )
+        ).first()
+
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found.")
+
+        # Log the change (In a real audit, you'd want to know the old vs new)
+        old_qty = product.quantity
+        product.quantity = new_quantity
+        
+        session.add(product)
+        session.commit()
+        
+        return {
+            "success": True,
+            "message": f"Manual audit completed for {product.name}",
+            "previous_qty": old_qty,
+            "new_qty": product.quantity,
+            "authorized_by": f"{current_user['username']} ({current_user['role']})"
+        }
