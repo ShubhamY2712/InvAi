@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Header, status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
-from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlmodel import Field, Session, SQLModel, create_engine, select, text
 from typing import Optional, List
 import os
 from dotenv import load_dotenv
@@ -138,6 +138,7 @@ class InventoryItem(SQLModel, table=True):
     business_id: str = Field(foreign_key="businessprofile.id")
 
 class Product(SQLModel, table=True):
+    __tablename__ = "product"
     id: int | None = Field(default=None, primary_key=True)
     name: str = Field(index=True)
     sku: str = Field(index=True) # Stock Keeping Unit (Barcode equivalent)
@@ -147,6 +148,8 @@ class Product(SQLModel, table=True):
     
     # The crucial multi-tenant lock: This ties the product to a specific business
     business_id: str = Field(foreign_key="businessprofile.id", index=True)
+
+    min_stock_level: int = Field(default=10)
 
 
 class Sale(SQLModel, table=True):
@@ -191,6 +194,24 @@ def reset_po_table():
     PurchaseOrder.__table__.drop(engine)
     PurchaseOrder.__table__.create(engine)
     return {"message": "✅ Purchase Order table upgraded and synced!"}
+
+
+@app.get("/create-batch-table")
+def create_batch_table():
+    # This safely creates ANY missing tables without breaking foreign keys
+    SQLModel.metadata.create_all(engine)
+    return {"message": "All missing tables (including ProductBatch) created successfully!"}
+
+@app.get("/upgrade-product-table")
+def upgrade_product_table():
+    with Session(engine) as session:
+        try:
+            # We use raw SQL to physically alter the existing table
+            session.exec(text("ALTER TABLE product ADD COLUMN min_stock_level INTEGER DEFAULT 10;"))
+            session.commit()
+            return {"message": "Success! min_stock_level column added to the database."}
+        except Exception as e:
+            return {"error": f"Column might already exist, or another error occurred: {str(e)}"}
 
 
 
@@ -665,7 +686,7 @@ class PurchaseOrderCreate(SQLModel):
     unit_cost: float
 
 class PurchaseOrder(SQLModel, table=True):
-    __tablename__ = "purchase_orders"  
+    __tablename__ = "purchase_order" 
     
     id: int | None = Field(default=None, primary_key=True)
     supplier_id: int = Field(index=True)
@@ -768,36 +789,46 @@ def mark_po_delivered(
 # --- STEP 3: The Shelf (Scan into Inventory) ---
 # This tracks how fast your staff puts boxes away, and FINALLY adds the stock.
 @app.put("/purchase-orders/{po_id}/stock")
-def stock_po_inventory(
-    po_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    with Session(engine) as session:
-        clean_business_id = str(current_user["business_id"]).strip()
-        po = session.exec(select(PurchaseOrder).where(PurchaseOrder.id == po_id, PurchaseOrder.business_id == clean_business_id)).first()
+def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Depends(get_current_user)):
+    # SECURITY CHECK
+    if current_user.get("role").lower() not in ["owner", "manager"]:
+        raise HTTPException(status_code=403, detail="Staff cannot stock inventory.")
         
-        if not po:
-            raise HTTPException(status_code=404, detail="Purchase Order not found.")
+    with Session(engine) as session:
+        # 1. Get the PO
+        po = session.get(PurchaseOrder, po_id)
+        if not po or po.business_id != current_user["business_id"]:
+            raise HTTPException(status_code=404, detail="Purchase Order not found")
+            
         if po.status != "DELIVERED":
-            raise HTTPException(status_code=400, detail="Boxes must be DELIVERED to the dock before they can be stocked.")
-
-        product = session.exec(select(Product).where(Product.id == po.product_id, Product.business_id == clean_business_id)).first()
-
-        # THE ATOMIC MATH ACTION!
+            raise HTTPException(status_code=400, detail="PO must be DELIVERED before it can be STOCKED")
+            
+        # 2. Update the PO status
         po.status = "STOCKED"
-        po.stocked_at = datetime.utcnow() # Stamps the millisecond your staff scanned it
-        product.quantity += po.quantity   
-
+        
+        # 3. Create the new Product Batch (Feature 8 Logic)
+        new_batch = ProductBatch(
+            product_id=po.product_id,
+            po_id=po.id,
+            business_id=current_user["business_id"],
+            quantity=po.quantity,
+            received_date=date.today(),
+            expiry_date=expiry_date  # The user provides this when stocking
+        )
+        session.add(new_batch)
+        
+        # 4. Update the main Product total quantity
+        product = session.get(Product, po.product_id)
+        if product:
+            product.quantity += po.quantity
+            session.add(product)
+            
         session.add(po)
-        session.add(product)
         session.commit()
-        session.refresh(product)
-
+        
         return {
-            "success": True,
-            "message": f"Successfully scanned! Added {po.quantity} units to the shelf.",
-            "new_stock_level": product.quantity,
-            "status": po.status
+            "message": f"PO Stocked. {po.quantity} items added to main inventory.",
+            "batch_expiry": new_batch.expiry_date
         }
     
 # --- MANUAL STOCK AUDIT (PROTECTED) ---
@@ -840,4 +871,100 @@ def manual_stock_adjustment(
             "previous_qty": old_qty,
             "new_qty": product.quantity,
             "authorized_by": f"{current_user['username']} ({current_user['role']})"
+        }
+    
+
+class ProductBatch(SQLModel, table=True):
+    __tablename__ = "product_batch"  # <--- FORCE THE TABLE NAME
+    id: int | None = Field(default=None, primary_key=True)
+    
+    # Notice how we use the exact strings we defined above
+    product_id: int = Field(foreign_key="product.id", index=True)
+    po_id: int | None = Field(default=None, foreign_key="purchase_order.id")
+    
+    business_id: str = Field(index=True)
+    quantity: int = Field(default=0)
+    received_date: date
+    expiry_date: date
+
+
+@app.get("/products/{product_id}/batches")
+def get_product_batches(product_id: int, current_user: dict = Depends(get_current_user)):
+    with Session(engine) as session:
+        # 1. Verify the product exists and belongs to this business
+        product = session.get(Product, product_id)
+        if not product or product.business_id != current_user["business_id"]:
+            raise HTTPException(status_code=404, detail="Product not found")
+            
+        # 2. Fetch all batches for this specific product
+        statement = select(ProductBatch).where(
+            ProductBatch.product_id == product_id,
+            ProductBatch.business_id == current_user["business_id"]
+        )
+        batches = session.exec(statement).all()
+        
+        # 3. Return the data
+        return batches
+    
+
+              #Low-Stock Alerts
+
+@app.get("/inventory/alerts/low-stock")
+def get_low_stock_alerts(current_user: dict = Depends(get_current_user)):
+    with Session(engine) as session:
+        # The AI Trigger Query
+        statement = select(Product).where(
+            Product.business_id == current_user["business_id"],
+            Product.quantity <= Product.min_stock_level
+        )
+        
+        low_stock_items = session.exec(statement).all()
+        
+        # We format the response to be highly readable for both the frontend UI and future AI agents
+        return {
+            "alert_count": len(low_stock_items),
+            "items_to_reorder": low_stock_items
+        }
+    
+
+@app.post("/system/daily-check")
+def daily_inventory_health_check(current_user: dict = Depends(get_current_user)):
+    # SECURITY CHECK: Only Owners/Managers can trigger system sweeps
+    if current_user.get("role").lower() not in ["owner", "manager"]:
+        raise HTTPException(status_code=403, detail="Unauthorized.")
+
+    with Session(engine) as session:
+        # 1. Find batches that expired today (or earlier) that still have items left in them
+        statement = select(ProductBatch).where(
+            ProductBatch.business_id == current_user["business_id"],
+            ProductBatch.expiry_date <= date.today(),
+            ProductBatch.quantity > 0
+        )
+        expired_batches = session.exec(statement).all()
+        
+        items_removed = 0
+        
+        # 2. Process each expired batch
+        for batch in expired_batches:
+            # Find the main product on the shelf
+            product = session.get(Product, batch.product_id)
+            if product:
+                # Remove the spoiled amount from the main sellable inventory
+                product.quantity -= batch.quantity
+                if product.quantity < 0:
+                    product.quantity = 0  # Safety net to prevent negative inventory
+                session.add(product)
+                
+            # "Trash" the batch quantity so the sweeper doesn't count it again tomorrow
+            items_removed += batch.quantity
+            batch.quantity = 0 
+            session.add(batch)
+            
+        # Save all changes to the database
+        session.commit()
+        
+        return {
+            "message": "Daily health check complete.",
+            "expired_batches_cleared": len(expired_batches),
+            "total_items_removed_from_shelf": items_removed
         }
