@@ -49,8 +49,8 @@ def test_cancel_pending_po(api, engine, rice, new_po, movements, in_sync):
     assert (body["message"], body["status"], body["reason"]) == (f"PO #{po_id} has been cancelled.", "CANCELLED", "Supplier out of stock")
     po = po_row(engine, po_id)
     assert (po.status, po.cancellation_reason) == ("CANCELLED", "Supplier out of stock")
-    assert po.cancelled_at.tzinfo is None
-    assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - po.cancelled_at) < timedelta(seconds=30)
+    assert po.cancelled_at.utcoffset() == timedelta(0)  # aware UTC
+    assert abs(datetime.now(timezone.utc) - po.cancelled_at) < timedelta(seconds=30)
     assert movements(rice) == before and in_sync(rice) == 5  # no stock change, no ledger entry
 
 
@@ -131,8 +131,8 @@ def test_cancelled_pos_excluded_from_scorecards(api, engine, rice):
         for status in ("STOCKED", "CANCELLED"):  # the cancelled one even carries timestamps inside the range
             session.add(PurchaseOrder(supplier_id=supplier_id, product_id=rice, business_id=BUSINESS_ID, quantity=Decimal("10"),
                                       unit_cost=Decimal("1"), total_cost=Decimal("10"), status=status,
-                                      timestamp=datetime(2031, 3, 1, 6, 30), delivered_at=datetime(2031, 3, 3, 6, 30),
-                                      stocked_at=datetime(2031, 3, 3, 8, 0), received_quantity=Decimal("10"),
+                                      timestamp=datetime(2031, 3, 1, 6, 30, tzinfo=timezone.utc), delivered_at=datetime(2031, 3, 3, 6, 30, tzinfo=timezone.utc),
+                                      stocked_at=datetime(2031, 3, 3, 8, 0, tzinfo=timezone.utc), received_quantity=Decimal("10"),
                                       rejected_quantity=Decimal("0")))
         session.commit()
     body = api("GET", f"/suppliers/{supplier_id}/scorecard?from_date=2031-03-01&to_date=2031-03-10")[1]

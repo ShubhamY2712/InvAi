@@ -12,7 +12,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 import secrets
 import statistics
-from sqlalchemy import Date, Index, func, or_
+from sqlalchemy import Date, DateTime, Index, func, or_
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.expression import FunctionElement
@@ -156,9 +157,31 @@ def require_active(product: "Product") -> None:
         raise HTTPException(status_code=409, detail=f"{product.name} is inactive. Reactivate it first.")
 
 def utc_now() -> datetime:
-    """Current UTC time as a naive datetime. The timestamp columns are 'timestamp without time zone',
-    and Postgres would shift an aware value into the session's time zone before storing it."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    """Current time as an aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+class UTCDateTime(TypeDecorator):
+    """timestamptz column that always hands back aware UTC datetimes.
+    Postgres returns timestamptz values in the session's time zone (e.g. +05:30 on a server set to India),
+    and SQLite returns them without any time zone; both come back as UTC here. Naive datetimes are refused
+    on the way in, because Postgres would read them in the session's time zone."""
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError(f"naive datetime {value!r} for a timestamptz column; use an aware UTC value (utc_now())")
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+# Pydantic would write UTC datetimes as "...Z"; send "+00:00", like every other timestamp in the API
+UTCTimestamp = Annotated[datetime, PlainSerializer(lambda value: value.isoformat(), return_type=str, when_used="json")]
 
 class UserRole(str, enum.Enum):
     OWNER = "Owner"
@@ -257,7 +280,7 @@ class Sale(SQLModel, table=True):
     total_price: Money = Field(max_digits=12, decimal_places=2)
 
     # Automatically stamps the exact millisecond the sale happens
-    timestamp: datetime = Field(default_factory=utc_now)
+    timestamp: UTCTimestamp = Field(default_factory=utc_now, sa_type=UTCDateTime)
 
 class Supplier(SQLModel, table=True):
     __tablename__ = "suppliers"
@@ -843,26 +866,34 @@ def get_sales_history(current_user: dict = Depends(get_current_user)):
         clean_user_id = int(str(current_user["user_id"]).strip())
         
         # The Logic Split: Owner vs Staff
-        if has_role(current_user, UserRole.OWNER, UserRole.MANAGER):
-            # The Boss sees EVERYTHING for this specific business
-            statement = select(Sale).where(Sale.business_id == current_user["business_id"])
-        else:
+        conditions = [Sale.business_id == current_user["business_id"]]
+        if not has_role(current_user, UserRole.OWNER, UserRole.MANAGER):
             # The Staff only sees the sales attached to their specific user_id
-            statement = select(Sale).where(
-                Sale.business_id == current_user["business_id"],
-                Sale.user_id == clean_user_id
-            )
-        
-        sales = session.exec(statement).all()
-        
+            conditions.append(Sale.user_id == clean_user_id)
+
+        sales = session.exec(select(Sale).where(*conditions)).all()
+
+        # Quantities sold per unit: kg and pieces are never added together.
+        # Left join, so a sale whose product no longer exists is reported as "unknown" rather than dropped.
+        per_unit = session.exec(
+            select(Product.unit, func.sum(Sale.quantity))
+            .select_from(Sale)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .where(*conditions)
+            .group_by(Product.unit)
+        ).all()
+        sold = {unit: Decimal(str(quantity)).quantize(Decimal("0.001")) for unit, quantity in per_unit}
+        items_sold_by_unit = {unit.value: sold[unit] for unit in StockUnit if unit in sold}
+        if None in sold:
+            items_sold_by_unit["unknown"] = sold[None]
+
         # Calculate quick analytics for the response
         total_revenue = sum(sale.total_price for sale in sales)
-        total_items_sold = sum(sale.quantity for sale in sales)
 
         return {
             "total_records": len(sales),
             "total_revenue": total_revenue,
-            "total_items_sold": total_items_sold,
+            "items_sold_by_unit": items_sold_by_unit,
             "sales_data": sales
         }
     
@@ -923,11 +954,11 @@ class PurchaseOrder(SQLModel, table=True):
     rejected_quantity: Quantity | None = Field(default=None, max_digits=12, decimal_places=3)
     
     # --- The 3-Step AI Analytics Timestamps ---
-    timestamp: datetime = Field(default_factory=utc_now) # Step 1: Placed Order
-    delivered_at: datetime | None = None                         # Step 2: Reached Loading Dock
-    stocked_at: datetime | None = None                           # Step 3: Scanned to Shelf
+    timestamp: UTCTimestamp = Field(default_factory=utc_now, sa_type=UTCDateTime)  # Step 1: Placed Order
+    delivered_at: UTCTimestamp | None = Field(default=None, sa_type=UTCDateTime)     # Step 2: Reached Loading Dock
+    stocked_at: UTCTimestamp | None = Field(default=None, sa_type=UTCDateTime)       # Step 3: Scanned to Shelf
     # Only pending POs can be cancelled; status becomes CANCELLED
-    cancelled_at: datetime | None = None
+    cancelled_at: UTCTimestamp | None = Field(default=None, sa_type=UTCDateTime)
     cancellation_reason: str | None = None
 
 @app.post("/purchase-orders/")
@@ -1057,7 +1088,7 @@ def mark_po_delivered(
             raise HTTPException(status_code=400, detail=f"Cannot deliver. Order is currently {po.status}")
 
         po.status = "DELIVERED"
-        po.delivered_at = utc_now() # Stamps the exact millisecond the truck arrived (naive UTC, like timestamp)
+        po.delivered_at = utc_now() # Stamps the exact moment the truck arrived (aware UTC)
         
         session.add(po)
         session.commit()
@@ -1315,7 +1346,7 @@ class StockMovement(SQLModel, table=True):
     user_id: int | None = Field(default=None, foreign_key="users.id")
     note: str | None = None
     product_quantity_after: Quantity = Field(max_digits=12, decimal_places=3)
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: UTCTimestamp = Field(default_factory=utc_now, sa_type=UTCDateTime)
 
 
 def acting_user_id(current_user: dict) -> int | None:
@@ -1473,26 +1504,28 @@ def daily_inventory_health_check(current_user: dict = Depends(get_current_user))
     return {"message": "Daily health check complete.", **result}
 
 # --- REPORTS: SALES & TRENDS ---
-# Sale timestamps are naive UTC; every report date and daily bucket is an India (Asia/Kolkata) calendar day.
+# Timestamps are timestamptz (aware UTC in Python); every report date and daily bucket is an India (Asia/Kolkata) calendar day.
 
 class ist_date(FunctionElement):
-    """SQL expression for the India calendar date of a naive-UTC timestamp column."""
+    """SQL expression for the India calendar date of a timestamptz column."""
     type = Date()
     name = "ist_date"
     inherit_cache = True
 
 @compiles(ist_date)
 def _ist_date_postgres(element, compiler, **kw):
-    return f"CAST(timezone('{BUSINESS_TZ.key}', timezone('UTC', {compiler.process(element.clauses, **kw)})) AS DATE)"
+    # timezone(zone, timestamptz) gives the wall time in that zone, whatever the session's time zone is
+    return f"CAST(timezone('{BUSINESS_TZ.key}', {compiler.process(element.clauses, **kw)}) AS DATE)"
 
 @compiles(ist_date, "sqlite")
 def _ist_date_sqlite(element, compiler, **kw):
-    # SQLite has no time zone database; India has used a fixed +05:30 offset since 1945
+    # SQLite stores the UTC wall time (UTCDateTime) and has no time zone database;
+    # India has used a fixed +05:30 offset since 1945
     return f"date({compiler.process(element.clauses, **kw)}, '+330 minutes')"
 
 def ist_day_start_utc(day: date) -> datetime:
-    """00:00 India time on day, as the naive UTC datetime sale timestamps are compared against."""
-    return datetime.combine(day, datetime.min.time(), tzinfo=BUSINESS_TZ).astimezone(timezone.utc).replace(tzinfo=None)
+    """00:00 India time on day, as an aware UTC datetime (the instant timestamps are compared against)."""
+    return datetime.combine(day, datetime.min.time(), tzinfo=BUSINESS_TZ).astimezone(timezone.utc)
 
 REPORT_DEFAULT_DAYS = 30
 REPORT_MAX_SPAN_DAYS = 366
@@ -1695,7 +1728,7 @@ def list_stock_movements(
         "movements": [
             {
                 "id": m.id,
-                "created_at": m.created_at.replace(tzinfo=timezone.utc),  # stored as naive UTC; sent with its offset
+                "created_at": m.created_at,  # aware UTC, so it is sent with +00:00
                 "product_id": m.product_id,
                 "product_name": name,
                 "unit": unit.value,
@@ -1759,9 +1792,9 @@ SCORECARD_DEFAULT_DAYS = 90
 RATIO_PLACES = Decimal("0.0001")
 DAYS_PLACES = Decimal("0.01")
 
-def ist_date_of(utc_naive: datetime) -> date:
-    """India calendar date of a naive-UTC timestamp."""
-    return utc_naive.replace(tzinfo=timezone.utc).astimezone(BUSINESS_TZ).date()
+def ist_date_of(moment: datetime) -> date:
+    """India calendar date of an aware timestamp."""
+    return moment.astimezone(BUSINESS_TZ).date()
 
 def _rounded_mean(values: list[Decimal], places: Decimal) -> Decimal | None:
     return (sum(values, Decimal("0")) / len(values)).quantize(places, rounding=ROUND_HALF_UP) if values else None

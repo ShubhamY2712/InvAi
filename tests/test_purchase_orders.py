@@ -23,15 +23,15 @@ def test_stocking_creates_batch_received_today(api, engine, make_product, in_syn
     assert in_sync(product_id) == 15
 
 
-def test_purchase_order_timestamp_is_naive_utc(api, engine, make_product):
+def test_purchase_order_timestamp_is_aware_utc(api, engine, make_product):
     product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [("5", None, -9)])
     supplier_id = api("POST", "/suppliers/", {"name": "Vendor"})[1]["supplier_id"]
     po_id = api("POST", "/purchase-orders/", {"supplier_id": supplier_id, "product_id": product_id,
                                               "quantity": 1, "unit_cost": 1})[1]["po_id"]
     with Session(engine) as session:
         stamp = session.get(PurchaseOrder, po_id).timestamp
-    assert stamp.tzinfo is None
-    assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - stamp) < timedelta(seconds=30)
+    assert stamp.utcoffset() == timedelta(0)  # aware UTC
+    assert abs(datetime.now(timezone.utc) - stamp) < timedelta(seconds=30)
 
 
 def delivered_po(api, product_id):
@@ -62,13 +62,13 @@ def test_stocking_accepts_expiry_tomorrow(api, engine, make_product):
     assert api("PUT", f"/purchase-orders/{po_id}/stock?expiry_date={day(1)}")[0] == 200
 
 
-def test_delivered_at_is_naive_utc(api, engine, make_product):
+def test_delivered_at_is_aware_utc(api, engine, make_product):
     product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [("5", None, -9)])
     po_id = delivered_po(api, product_id)
     with Session(engine) as session:
         po = session.get(PurchaseOrder, po_id)
-    assert po.delivered_at.tzinfo is None
-    assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - po.delivered_at) < timedelta(seconds=30)
+    assert po.delivered_at.utcoffset() == timedelta(0)  # aware UTC
+    assert abs(datetime.now(timezone.utc) - po.delivered_at) < timedelta(seconds=30)
     assert po.delivered_at >= po.timestamp  # same clock as the order timestamp
 
 

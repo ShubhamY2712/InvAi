@@ -1,7 +1,7 @@
 """Stock movement ledger: one entry per batch touched, written in the same transaction as the stock change.
 in_sync() (conftest) checks, after each operation, that every batch's entries sum to its quantity and every
 product's entries sum to Product.quantity."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -181,11 +181,11 @@ def add_movement(engine):
 def history(make_product, add_movement):
     rice, [rb] = make_product("Rice", StockUnit.KG, "1.00", [("0", None, -9)])
     milk, [mb] = make_product("Milk", StockUnit.LITRE, "1.00", [("0", None, -9)])
-    add_movement(rice, rb, "5", R.PURCHASE_RECEIPT, datetime(2031, 3, 4, 18, 29, 59))  # 2031-03-04 23:59:59 IST
-    add_movement(rice, rb, "-1", R.SALE, datetime(2031, 3, 4, 18, 30, 0))              # 2031-03-05 00:00:00 IST
-    add_movement(milk, mb, "-2", R.EXPIRY_DISPOSAL, datetime(2031, 3, 9, 6, 30), note="sour")
-    add_movement(milk, mb, "-0.5", R.EXPIRY_DISPOSAL, datetime(2031, 3, 1, 6, 30))
-    add_movement(milk, mb, "-0.25", R.EXPIRY_DISPOSAL, datetime(2031, 2, 1, 6, 30))  # before the range below
+    add_movement(rice, rb, "5", R.PURCHASE_RECEIPT, datetime(2031, 3, 4, 18, 29, 59, tzinfo=timezone.utc))  # 2031-03-04 23:59:59 IST
+    add_movement(rice, rb, "-1", R.SALE, datetime(2031, 3, 4, 18, 30, 0, tzinfo=timezone.utc))              # 2031-03-05 00:00:00 IST
+    add_movement(milk, mb, "-2", R.EXPIRY_DISPOSAL, datetime(2031, 3, 9, 6, 30, tzinfo=timezone.utc), note="sour")
+    add_movement(milk, mb, "-0.5", R.EXPIRY_DISPOSAL, datetime(2031, 3, 1, 6, 30, tzinfo=timezone.utc))
+    add_movement(milk, mb, "-0.25", R.EXPIRY_DISPOSAL, datetime(2031, 2, 1, 6, 30, tzinfo=timezone.utc))  # before the range below
     return rice, milk
 
 
@@ -234,7 +234,7 @@ def test_movements_max_limit_allowed(api):
 
 def test_movements_exclude_other_business(api, make_product, add_movement):
     theirs, [batch] = make_product("Theirs", StockUnit.KG, "1.00", [("0", None, -9)], business_id=OTHER_BUSINESS_ID)
-    add_movement(theirs, batch, "-1", R.SALE, datetime(2031, 3, 9, 6, 30), business_id=OTHER_BUSINESS_ID)
+    add_movement(theirs, batch, "-1", R.SALE, datetime(2031, 3, 9, 6, 30, tzinfo=timezone.utc), business_id=OTHER_BUSINESS_ID)
     assert api("GET", f"/inventory/movements?{RANGE}")[1]["movements"] == []
     assert api("GET", f"/inventory/movements?{RANGE}&product_id={theirs}")[1]["movements"] == []
 
@@ -250,8 +250,8 @@ def test_staff_cannot_view(engine, path):
 def test_waste_report_per_product_with_units(api, history, make_product, add_movement):
     rice, milk = history
     flour, [fb] = make_product("Flour", StockUnit.KG, "1.00", [("0", None, -9)])
-    add_movement(flour, fb, "-1.25", R.EXPIRY_DISPOSAL, datetime(2031, 3, 2, 6, 30))
-    add_movement(flour, fb, "-3", R.AUDIT_DECREASE, datetime(2031, 3, 2, 6, 30))  # not waste from expiry
+    add_movement(flour, fb, "-1.25", R.EXPIRY_DISPOSAL, datetime(2031, 3, 2, 6, 30, tzinfo=timezone.utc))
+    add_movement(flour, fb, "-3", R.AUDIT_DECREASE, datetime(2031, 3, 2, 6, 30, tzinfo=timezone.utc))  # not waste from expiry
     status, body = api("GET", f"/reports/waste?{RANGE}")
     assert status == 200
     assert body["total_entries"] == 3
@@ -263,7 +263,7 @@ def test_waste_report_per_product_with_units(api, history, make_product, add_mov
 
 def test_waste_report_respects_range_and_business(api, history, make_product, add_movement):
     theirs, [batch] = make_product("Theirs", StockUnit.KG, "1.00", [("0", None, -9)], business_id=OTHER_BUSINESS_ID)
-    add_movement(theirs, batch, "-9", R.EXPIRY_DISPOSAL, datetime(2031, 3, 9, 6, 30), business_id=OTHER_BUSINESS_ID)
+    add_movement(theirs, batch, "-9", R.EXPIRY_DISPOSAL, datetime(2031, 3, 9, 6, 30, tzinfo=timezone.utc), business_id=OTHER_BUSINESS_ID)
     body = api("GET", "/reports/waste?from_date=2031-02-01&to_date=2031-02-28")[1]
     assert body["total_entries"] == 1 and [p["quantity_disposed"] for p in body["products"]] == [0.25]
 

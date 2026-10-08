@@ -138,11 +138,11 @@ def test_stock_matches_batches_after_every_sale(api, make_product, stock, in_syn
     assert stock(product_id)[0] == 2  # only the expired 1.5 + 0.5 remain
 
 
-def test_sale_timestamp_is_naive_utc(api, engine, make_product):
+def test_sale_timestamp_is_aware_utc(api, engine, make_product):
     product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [("5", None, 0)])
     status, body = checkout(api, product_id, 1)
     assert status == 200
     with Session(engine) as session:
         stamp = session.get(Sale, body["sale_id"]).timestamp
-    assert stamp.tzinfo is None
-    assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - stamp) < timedelta(seconds=30)
+    assert stamp.utcoffset() == timedelta(0)  # aware UTC
+    assert abs(datetime.now(timezone.utc) - stamp) < timedelta(seconds=30)

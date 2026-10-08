@@ -1,6 +1,6 @@
 """Partial PO receipts and supplier scorecards. today() is pinned to 2031-03-10; timestamps are naive UTC and
 India is UTC+05:30, so 18:30 UTC is midnight IST."""
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -12,7 +12,7 @@ from conftest import BUSINESS_ID, OTHER_BUSINESS_ID, REAL_TODAY, asgi_request, d
 
 
 def at(text):
-    return datetime.fromisoformat(text)
+    return datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
 
 
 @pytest.fixture

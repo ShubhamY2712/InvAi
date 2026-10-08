@@ -1,6 +1,6 @@
 """Sales & Trends reports. today() is pinned to 2031-03-10 (conftest); sale timestamps are naive UTC.
 India is UTC+05:30, so 18:30 UTC is midnight IST: 2031-03-04 18:30:00 UTC is 2031-03-05 00:00 IST."""
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -25,12 +25,12 @@ def make_sale(engine):
 
 
 def utc(text):
-    return datetime.fromisoformat(text)
+    return datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
 
 
 def ist_noon(day):
     """06:30 UTC = 12:00 IST on the given date."""
-    return datetime.combine(day, datetime.min.time()) + timedelta(hours=6, minutes=30)
+    return datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=6, minutes=30)
 
 
 # --- access and validation ---
