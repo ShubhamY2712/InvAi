@@ -1,7 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from typing import Optional, List
+from typing import List
 import os
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
@@ -140,17 +140,6 @@ class User(SQLModel, table=True):
     role: UserRole = Field(default=UserRole.STAFF)
     business_id: str = Field(foreign_key="businessprofile.id") 
 
-class InventoryItem(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    name: str
-    price: float
-    quantity: float
-    barcode: Optional[str] = None
-    is_loose_item: bool = False
-    parent_id: Optional[int] = Field(default=None, foreign_key="inventoryitem.id")
-    units_per_parent: Optional[float] = None
-    business_id: str = Field(foreign_key="businessprofile.id")
-
 class Product(SQLModel, table=True):
     __tablename__ = "product"
     id: int | None = Field(default=None, primary_key=True)
@@ -178,10 +167,6 @@ class Sale(SQLModel, table=True):
     
     # Automatically stamps the exact millisecond the sale happens
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-    # --- NEW: FEATURE 8 (EXPIRY MANAGEMENT) ---
-    batch_number: Optional[str] = None
-    expiry_date: Optional[date] = None
 
 class Supplier(SQLModel, table=True):
     __tablename__ = "suppliers"
@@ -471,40 +456,45 @@ def add_employee(
   # --- 7. FEATURE 8: EXPIRY MANAGEMENT (The Alarm System) ---
 
 @app.get("/alerts/expiring-soon/")
-def get_expiring_items(
-    days_warning: int = 30, 
-    x_user_id: str = Header(..., description="Simulated Auth Token")
+def get_expiring_batches(
+    days: int = Query(7, ge=0, le=3650, description="How many days ahead to look"),
+    current_user: dict = Depends(get_current_user)
 ):
-    """
-    Scans the tenant's inventory and returns items expiring within the specified days.
-    Defaults to a 30-day warning window.
-    """
+    """Returns this business's batches expiring between today and today + days, soonest first."""
+    today = date.today()
+    window_end = today + timedelta(days=days)
+
     with Session(engine) as session:
-        # 1. Identity & SaaS Lock Check
-        user = session.get(User, x_user_id)
-        if not user:
-            raise HTTPException(status_code=401, detail="Unauthorized.")
-            
-        # 2. Calculate the "Danger Zone" Date
-        # If today is April 26, 2026, threshold_date becomes May 26, 2026.
-        threshold_date = date.today() + timedelta(days=days_warning)
-        
-        # 3. Database Radar Scan
-        # Find items where: Business matches AND expiry date exists AND expiry date is before the threshold
-        statement = select(InventoryItem).where(
-            InventoryItem.business_id == user.business_id,
-            InventoryItem.expiry_date != None,
-            InventoryItem.expiry_date <= threshold_date
+        statement = (
+            select(ProductBatch, Product.name)
+            .join(Product, Product.id == ProductBatch.product_id)
+            .where(
+                ProductBatch.business_id == current_user["business_id"],
+                ProductBatch.expiry_date >= today,
+                ProductBatch.expiry_date <= window_end,
+                ProductBatch.quantity > 0
+            )
+            .order_by(ProductBatch.expiry_date, ProductBatch.id)
         )
-        
-        expiring_items = session.exec(statement).all()
-        
+        rows = session.exec(statement).all()
+
+        batches = [
+            {
+                "batch_id": batch.id,
+                "product_name": product_name,
+                "expiry_date": batch.expiry_date,
+                "quantity": batch.quantity,
+                "days_left": (batch.expiry_date - today).days
+            }
+            for batch, product_name in rows
+        ]
+
         return {
             "success": True,
-            "business_id": user.business_id,
-            "danger_zone_date": threshold_date,
-            "alert_count": len(expiring_items),
-            "data": expiring_items
+            "business_id": current_user["business_id"],
+            "window_end": window_end,
+            "alert_count": len(batches),
+            "batches": batches
         }
     
 @app.get("/dev/me/")
