@@ -146,6 +146,11 @@ def require_future_expiry(expiry_date: date | None) -> None:
             detail=f"expiry_date must be after today ({current_date}). Stock expiring today or earlier is already expired and can't be sold."
         )
 
+def require_active(product: "Product") -> None:
+    """Raises 409 if the product has been deactivated."""
+    if not product.is_active:
+        raise HTTPException(status_code=409, detail=f"{product.name} is inactive. Reactivate it first.")
+
 def utc_now() -> datetime:
     """Current UTC time as a naive datetime. The timestamp columns are 'timestamp without time zone',
     and Postgres would shift an aware value into the session's time zone before storing it."""
@@ -220,6 +225,9 @@ class Product(SQLModel, table=True):
     business_id: str = Field(foreign_key="businessprofile.id", index=True)
 
     min_stock_level: Quantity = Field(default=Decimal("10"), max_digits=12, decimal_places=3)
+
+    # Deactivated products keep their history but can't be sold, ordered, stocked or audited
+    is_active: bool = Field(default=True)
 
 
 class Sale(SQLModel, table=True):
@@ -423,10 +431,15 @@ def add_product(
         }
     
 @app.get("/products/")
-def get_inventory(current_user: dict = Depends(get_current_user)):
+def get_inventory(
+    include_inactive: bool = Query(False, description="Also list deactivated products"),
+    current_user: dict = Depends(get_current_user)
+):
     with Session(engine) as session:
         # The ultimate security filter: ONLY return products matching this user's business_id
         statement = select(Product).where(Product.business_id == current_user["business_id"])
+        if not include_inactive:
+            statement = statement.where(Product.is_active == True)  # noqa: E712 (SQL expression)
         products = session.exec(statement).all()
         
         return {
@@ -507,16 +520,17 @@ def delete_product(
     product_id: int, 
     current_user: dict = Depends(get_current_user)
 ):
-    
+    """Deactivates the product. Nothing is deleted: its batches, sales and ledger history stay."""
     # SECURITY CHECK
     require_role(current_user, UserRole.OWNER, detail="Only the Owner can delete products from the system.")
     
     with Session(engine) as session:
         # 1. Search for the product using the ID AND the Business ID (The Multi-Tenant Lock)
+        # Locked, so stock or a new purchase order can't arrive between the checks below and the save
         statement = select(Product).where(
             Product.id == product_id, 
             Product.business_id == current_user["business_id"]
-        )
+        ).with_for_update()
         product = session.exec(statement).first()
 
         # 2. If it's not there or belongs to someone else, say it's not found
@@ -526,14 +540,57 @@ def delete_product(
                 detail="Product not found or access denied"
             )
 
-        # 3. Remove it from the database
-        session.delete(product)
+        if not product.is_active:
+            return {"success": True, "message": f"{product.name} is already inactive.", "product_id": product.id, "is_active": False}
+
+        # 3. Only an empty product with no incoming stock can be deactivated
+        if product.quantity > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(f"{product.name} still has {format_qty(product.quantity, product.unit)} in stock. "
+                        "Run a manual audit to bring it to 0 before deactivating.")
+            )
+        open_pos = session.exec(
+            select(PurchaseOrder.id).where(
+                PurchaseOrder.product_id == product.id,
+                PurchaseOrder.status.in_(["PENDING", "DELIVERED"])
+            ).order_by(PurchaseOrder.id)
+        ).all()
+        if open_pos:
+            raise HTTPException(
+                status_code=409,
+                detail=(f"{product.name} has purchase orders that aren't stocked yet "
+                        f"({', '.join(f'#{po_id}' for po_id in open_pos)}). Stock them before deactivating.")
+            )
+
+        # 4. Deactivate (history stays)
+        product.is_active = False
+        session.add(product)
         session.commit()
 
-        return {
-            "success": True, 
-            "message": f"Product '{product.name}' has been permanently removed from InvAi."
-        }
+        return {"success": True, "message": f"{product.name} has been deactivated.", "product_id": product.id, "is_active": False}
+
+@app.post("/products/{product_id}/reactivate")
+def reactivate_product(product_id: int, current_user: dict = Depends(get_current_user)):
+    require_role(current_user, UserRole.OWNER, detail="Only the Owner can reactivate products.")
+
+    with Session(engine) as session:
+        product = session.exec(
+            select(Product).where(
+                Product.id == product_id,
+                Product.business_id == current_user["business_id"]
+            ).with_for_update()
+        ).first()
+        if not product:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found or access denied")
+
+        if product.is_active:
+            return {"success": True, "message": f"{product.name} is already active.", "product_id": product.id, "is_active": True}
+
+        product.is_active = True
+        session.add(product)
+        session.commit()
+        return {"success": True, "message": f"{product.name} has been reactivated.", "product_id": product.id, "is_active": True}
     
     # --- 6. FEATURE 2: EMPLOYEE MANAGEMENT (The RBAC Loop) ---
 
@@ -671,6 +728,7 @@ def process_checkout(
         # 3. Validation: Does it exist?
         if not product:
             raise HTTPException(status_code=404, detail="Product not found in your inventory.")
+        require_active(product)
 
         # 4. Validation: piece products are sold in whole units only
         if product.unit == StockUnit.PIECE and request.quantity != request.quantity.to_integral_value():
@@ -843,6 +901,9 @@ class PurchaseOrder(SQLModel, table=True):
     timestamp: datetime = Field(default_factory=utc_now) # Step 1: Placed Order
     delivered_at: datetime | None = None                         # Step 2: Reached Loading Dock
     stocked_at: datetime | None = None                           # Step 3: Scanned to Shelf
+    # Only pending POs can be cancelled; status becomes CANCELLED
+    cancelled_at: datetime | None = None
+    cancellation_reason: str | None = None
 
 @app.post("/purchase-orders/")
 def process_purchase_order(
@@ -866,14 +927,16 @@ def process_purchase_order(
             raise HTTPException(status_code=404, detail="Supplier not found.")
 
         # 2. Verify the Product belongs to this business
+        # Locked, so a deactivation can't slip in between this check and the new PO
         product = session.exec(
             select(Product).where(
                 Product.id == request.product_id, 
                 Product.business_id == current_user["business_id"]
-            )
+            ).with_for_update()
         ).first()
         if not product:
             raise HTTPException(status_code=404, detail="Product not found in inventory.")
+        require_active(product)
         if product.unit == StockUnit.PIECE and request.quantity != request.quantity.to_integral_value():
             raise HTTPException(
                 status_code=422,
@@ -911,16 +974,60 @@ def process_purchase_order(
             "expected_delivery_date": new_po.expected_delivery_date
         }
     
+@app.post("/purchase-orders/{po_id}/cancel")
+def cancel_purchase_order(
+    po_id: int,
+    reason: str | None = Query(None, max_length=500, description="Why the order was cancelled"),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Only the Owner or a Manager can cancel purchase orders.")
+
+    with Session(engine) as session:
+        # Locked, so it can't be delivered or stocked while it is being cancelled
+        po = session.exec(
+            select(PurchaseOrder).where(
+                PurchaseOrder.id == po_id,
+                PurchaseOrder.business_id == current_user["business_id"]
+            ).with_for_update()
+        ).first()
+        if not po:
+            raise HTTPException(status_code=404, detail="Purchase Order not found.")
+
+        if po.status == "CANCELLED":  # keep the original time and reason
+            return {"success": True, "message": f"PO #{po.id} is already cancelled.", "po_id": po.id, "status": po.status,
+                    "cancelled_at": po.cancelled_at, "reason": po.cancellation_reason}
+        if po.status == "DELIVERED":
+            raise HTTPException(
+                status_code=409,
+                detail=(f"PO #{po.id} has already been delivered and can't be cancelled. To refuse the goods, "
+                        "stock it with rejected_quantity equal to received_quantity.")
+            )
+        if po.status != "PENDING":
+            raise HTTPException(status_code=409, detail=f"PO #{po.id} has already been {po.status.lower()} and can't be cancelled.")
+
+        po.status = "CANCELLED"
+        po.cancelled_at = utc_now()
+        po.cancellation_reason = reason
+        session.add(po)
+        session.commit()
+        session.refresh(po)
+
+        return {"success": True, "message": f"PO #{po.id} has been cancelled.", "po_id": po.id, "status": po.status,
+                "cancelled_at": po.cancelled_at, "reason": po.cancellation_reason}
+
 @app.put("/purchase-orders/{po_id}/deliver")
 def mark_po_delivered(
     po_id: int,
     current_user: dict = Depends(get_current_user)
 ):
     with Session(engine) as session:
-        po = session.exec(select(PurchaseOrder).where(PurchaseOrder.id == po_id, PurchaseOrder.business_id == current_user["business_id"])).first()
+        # Locked, so a concurrent cancellation and delivery can't both succeed
+        po = session.exec(select(PurchaseOrder).where(PurchaseOrder.id == po_id, PurchaseOrder.business_id == current_user["business_id"]).with_for_update()).first()
         
         if not po:
             raise HTTPException(status_code=404, detail="Purchase Order not found.")
+        if po.status == "CANCELLED":
+            raise HTTPException(status_code=409, detail=f"PO #{po.id} was cancelled and can't be delivered.")
         if po.status != "PENDING":
             raise HTTPException(status_code=400, detail=f"Cannot deliver. Order is currently {po.status}")
 
@@ -964,10 +1071,13 @@ def stock_purchase_order(
         if not po:
             raise HTTPException(status_code=404, detail="Purchase Order not found")
             
+        if po.status == "CANCELLED":
+            raise HTTPException(status_code=409, detail=f"PO #{po.id} was cancelled and can't be stocked.")
         if po.status != "DELIVERED":
             raise HTTPException(status_code=400, detail="PO must be DELIVERED before it can be STOCKED")
 
         product = session.exec(select(Product).where(Product.id == po.product_id).with_for_update()).first()
+        require_active(product)
 
         # 2. What arrived, and how much of it is accepted
         received = po.quantity if received_quantity is None else received_quantity
@@ -1055,6 +1165,7 @@ def manual_stock_adjustment(
 
         if not product:
             raise HTTPException(status_code=404, detail="Product not found.")
+        require_active(product)
 
         if product.unit == StockUnit.PIECE and new_quantity != new_quantity.to_integral_value():
             raise HTTPException(
@@ -1235,6 +1346,7 @@ def get_low_stock_alerts(current_user: dict = Depends(get_current_user)):
         # The AI Trigger Query
         statement = select(Product).where(
             Product.business_id == current_user["business_id"],
+            Product.is_active == True,  # noqa: E712 (SQL expression)
             Product.quantity <= Product.min_stock_level
         )
         
