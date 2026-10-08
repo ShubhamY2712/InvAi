@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 import secrets
+import statistics
 from sqlalchemy import Date, Index, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.compiler import compiles
@@ -818,8 +819,9 @@ def add_supplier(
 class PurchaseOrderCreate(SQLModel):
     supplier_id: int
     product_id: int
-    quantity: int
-    unit_cost: Money = Field(max_digits=12, decimal_places=2)
+    quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=3)  # whole numbers for piece products (checked below)
+    unit_cost: Money = Field(ge=0, max_digits=12, decimal_places=2)
+    expected_delivery_date: date | None = None  # must be after today()
 
 class PurchaseOrder(SQLModel, table=True):
     __tablename__ = "purchase_order" 
@@ -832,6 +834,10 @@ class PurchaseOrder(SQLModel, table=True):
     unit_cost: Money = Field(max_digits=12, decimal_places=2)
     total_cost: Money = Field(max_digits=12, decimal_places=2)
     status: str = Field(default="PENDING") 
+    expected_delivery_date: date | None = None
+    # Set at stocking: what arrived, and how much of it was rejected (accepted = received - rejected)
+    received_quantity: Quantity | None = Field(default=None, max_digits=12, decimal_places=3)
+    rejected_quantity: Quantity | None = Field(default=None, max_digits=12, decimal_places=3)
     
     # --- The 3-Step AI Analytics Timestamps ---
     timestamp: datetime = Field(default_factory=utc_now) # Step 1: Placed Order
@@ -843,6 +849,10 @@ def process_purchase_order(
     request: PurchaseOrderCreate,
     current_user: dict = Depends(get_current_user)
 ):
+    current_date = today()
+    if request.expected_delivery_date is not None and request.expected_delivery_date <= current_date:
+        raise HTTPException(status_code=422, detail=f"expected_delivery_date must be after today ({current_date}).")
+
     with Session(engine) as session:
 
         # 1. Verify the Supplier belongs to this business
@@ -864,6 +874,11 @@ def process_purchase_order(
         ).first()
         if not product:
             raise HTTPException(status_code=404, detail="Product not found in inventory.")
+        if product.unit == StockUnit.PIECE and request.quantity != request.quantity.to_integral_value():
+            raise HTTPException(
+                status_code=422,
+                detail=f"{product.name} is counted by the piece, so quantity must be a whole number."
+            )
 
         # 3.  PO Receipt 
         calculated_total_cost = round_money(request.quantity * request.unit_cost)
@@ -875,7 +890,8 @@ def process_purchase_order(
             quantity=request.quantity,
             unit_cost=request.unit_cost,          
             total_cost=calculated_total_cost,
-            status="PENDING"      # <--- Explicitly mark it as waiting for delivery
+            status="PENDING",     # <--- Explicitly mark it as waiting for delivery
+            expected_delivery_date=request.expected_delivery_date
         )
 
         # Add ONLY the receipt to the vault (Notice we don't add the product anymore)
@@ -891,7 +907,8 @@ def process_purchase_order(
             "current_stock_level": product.quantity,  # Unchanged!
             "expense": calculated_total_cost,
             "po_id": new_po.id,
-            "status": new_po.status
+            "status": new_po.status,
+            "expected_delivery_date": new_po.expected_delivery_date
         }
     
 @app.put("/purchase-orders/{po_id}/deliver")
@@ -923,49 +940,82 @@ def mark_po_delivered(
 # --- STEP 3: The Shelf (Scan into Inventory) ---
 # This tracks how fast your staff puts boxes away, and FINALLY adds the stock.
 @app.put("/purchase-orders/{po_id}/stock")
-def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Depends(get_current_user)):
+def stock_purchase_order(
+    po_id: int,
+    expiry_date: date | None = Query(None, description="Expiry of the stocked batch; leave out if it never expires"),
+    received_quantity: Decimal | None = Query(None, ge=0, max_digits=12, decimal_places=3,
+                                              description="How much arrived (default: the ordered quantity)"),
+    rejected_quantity: Decimal = Query(Decimal("0"), ge=0, max_digits=12, decimal_places=3,
+                                       description="How much of it was rejected at the dock"),
+    current_user: dict = Depends(get_current_user)
+):
     # SECURITY CHECK
     require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Staff cannot stock inventory.")
     require_future_expiry(expiry_date)
 
     with Session(engine) as session:
-        # 1. Get the PO
-        po = session.get(PurchaseOrder, po_id)
-        if not po or po.business_id != current_user["business_id"]:
+        # 1. Lock the PO (so it can't be stocked twice), then its product (so a concurrent sale isn't overwritten)
+        po = session.exec(
+            select(PurchaseOrder).where(
+                PurchaseOrder.id == po_id,
+                PurchaseOrder.business_id == current_user["business_id"]
+            ).with_for_update()
+        ).first()
+        if not po:
             raise HTTPException(status_code=404, detail="Purchase Order not found")
             
         if po.status != "DELIVERED":
             raise HTTPException(status_code=400, detail="PO must be DELIVERED before it can be STOCKED")
-            
-        # 2. Update the PO status
-        po.status = "STOCKED"
-        
-        # 3. Create the new Product Batch (Feature 8 Logic)
-        new_batch = ProductBatch(
-            product_id=po.product_id,
-            po_id=po.id,
-            business_id=current_user["business_id"],
-            quantity=po.quantity,
-            received_date=today(),
-            expiry_date=expiry_date  # The user provides this when stocking
-        )
-        session.add(new_batch)
-        session.flush()  # assigns new_batch.id for the ledger
 
-        # 4. Update the main Product total quantity
-        product = session.get(Product, po.product_id)
-        if product:
-            product.quantity += po.quantity
+        product = session.exec(select(Product).where(Product.id == po.product_id).with_for_update()).first()
+
+        # 2. What arrived, and how much of it is accepted
+        received = po.quantity if received_quantity is None else received_quantity
+        if rejected_quantity > received:
+            raise HTTPException(status_code=422, detail="rejected_quantity can't be more than received_quantity.")
+        if product.unit == StockUnit.PIECE and any(q != q.to_integral_value() for q in (Decimal(str(received)), rejected_quantity)):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{product.name} is counted by the piece, so received_quantity and rejected_quantity must be whole numbers."
+            )
+        accepted = received - rejected_quantity
+
+        # 3. Close the PO, even if the delivery was short or fully rejected
+        po.status = "STOCKED"
+        po.stocked_at = utc_now()
+        po.received_quantity = received
+        po.rejected_quantity = rejected_quantity
+        session.add(po)
+
+        # 4. Only accepted stock becomes a batch, stock, and a ledger entry
+        new_batch = None
+        if accepted > 0:
+            new_batch = ProductBatch(
+                product_id=po.product_id,
+                po_id=po.id,
+                business_id=current_user["business_id"],
+                quantity=accepted,
+                received_date=today(),
+                expiry_date=expiry_date  # None: never expires, like opening and audit batches
+            )
+            session.add(new_batch)
+            session.flush()  # assigns new_batch.id for the ledger
+            product.quantity += accepted
             session.add(product)
-            record_movements(session, product, MovementReason.PURCHASE_RECEIPT, [(new_batch.id, po.quantity)],
+            record_movements(session, product, MovementReason.PURCHASE_RECEIPT, [(new_batch.id, accepted)],
                              po_id=po.id, user_id=acting_user_id(current_user))
 
-        session.add(po)
         session.commit()
-        
+
+        counts = f"{format_qty(received, product.unit)} received, {format_qty(rejected_quantity, product.unit)} rejected"
         return {
-            "message": f"PO Stocked. {format_qty(po.quantity, product.unit if product else None)} added to main inventory.",
-            "batch_expiry": new_batch.expiry_date
+            "message": (f"PO Stocked. {format_qty(accepted, product.unit)} added to main inventory ({counts})."
+                        if new_batch else f"PO closed. Nothing added to inventory ({counts})."),
+            "received_quantity": received,
+            "rejected_quantity": rejected_quantity,
+            "accepted_quantity": accepted,
+            "batch_id": new_batch.id if new_batch else None,
+            "batch_expiry": new_batch.expiry_date if new_batch else None
         }
     
 # --- MANUAL STOCK AUDIT (PROTECTED) ---
@@ -1306,10 +1356,10 @@ def ist_day_start_utc(day: date) -> datetime:
 REPORT_DEFAULT_DAYS = 30
 REPORT_MAX_SPAN_DAYS = 366
 
-def report_range(from_date: date | None, to_date: date | None) -> tuple[date, date]:
-    """Fills in the default range (the last 30 days including today) and validates it."""
+def report_range(from_date: date | None, to_date: date | None, default_days: int = REPORT_DEFAULT_DAYS) -> tuple[date, date]:
+    """Fills in the default range (the last default_days days including today) and validates it."""
     to_date = to_date or today()
-    from_date = from_date or to_date - timedelta(days=REPORT_DEFAULT_DAYS - 1)
+    from_date = from_date or to_date - timedelta(days=default_days - 1)
     if from_date > to_date:
         raise HTTPException(status_code=422, detail="from_date must be on or before to_date.")
     if (to_date - from_date).days > REPORT_MAX_SPAN_DAYS:
@@ -1558,3 +1608,118 @@ def waste_report(
             for product_id, name, unit, quantity, entries in rows
         ]
     }
+
+
+# --- SUPPLIER SCORECARDS ---
+# Based on the POs stocked (closed) on India dates in the range. Computed in Python from one query's rows:
+# most metrics are averages of per-PO ratios, and SQLite (used in tests) has no standard deviation.
+
+SCORECARD_DEFAULT_DAYS = 90
+RATIO_PLACES = Decimal("0.0001")
+DAYS_PLACES = Decimal("0.01")
+
+def ist_date_of(utc_naive: datetime) -> date:
+    """India calendar date of a naive-UTC timestamp."""
+    return utc_naive.replace(tzinfo=timezone.utc).astimezone(BUSINESS_TZ).date()
+
+def _rounded_mean(values: list[Decimal], places: Decimal) -> Decimal | None:
+    return (sum(values, Decimal("0")) / len(values)).quantize(places, rounding=ROUND_HALF_UP) if values else None
+
+def supplier_metrics(pos: list["PurchaseOrder"]) -> dict:
+    """Scorecard metrics for one supplier's stocked POs. Every metric is None when there are no POs, and each is
+    None when no PO qualifies for it."""
+    metrics = {"po_count": len(pos), "avg_lead_time_days": None, "on_time_rate": None,
+               "fill_rate": None, "defect_rate": None, "price_volatility": None}
+    if not pos:
+        return metrics
+
+    lead_days = [Decimal(str((po.delivered_at - po.timestamp).total_seconds())) / 86400
+                 for po in pos if po.delivered_at and po.timestamp]
+    on_time = [Decimal(1) if ist_date_of(po.delivered_at) <= po.expected_delivery_date else Decimal(0)
+               for po in pos if po.expected_delivery_date and po.delivered_at]
+
+    fills, defects = [], []
+    for po in pos:
+        ordered = Decimal(str(po.quantity))
+        # POs stocked before these columns existed took the full order with nothing rejected
+        received = Decimal(str(po.received_quantity)) if po.received_quantity is not None else ordered
+        rejected = Decimal(str(po.rejected_quantity)) if po.rejected_quantity is not None else Decimal("0")
+        if ordered > 0:
+            fills.append(min(received / ordered, Decimal(1)))
+        if received > 0:
+            defects.append(rejected / received)
+
+    # Price volatility: coefficient of variation (population std dev / mean) of unit_cost per product
+    costs_by_product: dict[int, list[Decimal]] = {}
+    for po in pos:
+        costs_by_product.setdefault(po.product_id, []).append(Decimal(str(po.unit_cost)))
+    volatilities = [statistics.pstdev(costs) / statistics.mean(costs)
+                    for costs in costs_by_product.values() if len(costs) >= 2 and statistics.mean(costs) > 0]
+
+    metrics.update({
+        "avg_lead_time_days": _rounded_mean(lead_days, DAYS_PLACES),
+        "on_time_rate": _rounded_mean(on_time, RATIO_PLACES),
+        "fill_rate": _rounded_mean(fills, RATIO_PLACES),
+        "defect_rate": _rounded_mean(defects, RATIO_PLACES),
+        "price_volatility": _rounded_mean(volatilities, RATIO_PLACES),
+    })
+    return metrics
+
+def stocked_pos_in_range(session: Session, business_id: str, from_date: date, to_date: date,
+                         supplier_id: int | None = None) -> list["PurchaseOrder"]:
+    conditions = [
+        PurchaseOrder.business_id == business_id,
+        PurchaseOrder.status == "STOCKED",
+        PurchaseOrder.stocked_at >= ist_day_start_utc(from_date),
+        PurchaseOrder.stocked_at < ist_day_start_utc(to_date + timedelta(days=1)),
+    ]
+    if supplier_id is not None:
+        conditions.append(PurchaseOrder.supplier_id == supplier_id)
+    return session.exec(select(PurchaseOrder).where(*conditions).order_by(PurchaseOrder.id)).all()
+
+SCORECARD_ROLE_MESSAGE = "Only the Owner or a Manager can view supplier scorecards."
+
+@app.get("/suppliers/scorecards")
+def supplier_scorecards(
+    from_date: date | None = Query(None, description="First India date (default: 89 days before to_date)"),
+    to_date: date | None = Query(None, description="Last India date, inclusive (default: today)"),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail=SCORECARD_ROLE_MESSAGE)
+    from_date, to_date = report_range(from_date, to_date, default_days=SCORECARD_DEFAULT_DAYS)
+    with Session(engine) as session:
+        suppliers = session.exec(
+            select(Supplier).where(Supplier.business_id == current_user["business_id"]).order_by(Supplier.name, Supplier.id)
+        ).all()
+        pos_by_supplier: dict[int, list] = {}
+        for po in stocked_pos_in_range(session, current_user["business_id"], from_date, to_date):
+            pos_by_supplier.setdefault(po.supplier_id, []).append(po)
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "suppliers": [
+            {"supplier_id": s.id, "name": s.name, **supplier_metrics(pos_by_supplier.get(s.id, []))}
+            for s in suppliers
+        ]
+    }
+
+@app.get("/suppliers/{supplier_id}/scorecard")
+def supplier_scorecard(
+    supplier_id: int,
+    from_date: date | None = Query(None, description="First India date (default: 89 days before to_date)"),
+    to_date: date | None = Query(None, description="Last India date, inclusive (default: today)"),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail=SCORECARD_ROLE_MESSAGE)
+    from_date, to_date = report_range(from_date, to_date, default_days=SCORECARD_DEFAULT_DAYS)
+    with Session(engine) as session:
+        supplier = session.exec(
+            select(Supplier).where(Supplier.id == supplier_id, Supplier.business_id == current_user["business_id"])
+        ).first()
+        if not supplier:
+            raise HTTPException(status_code=404, detail="Supplier not found.")
+        pos = stocked_pos_in_range(session, current_user["business_id"], from_date, to_date, supplier_id=supplier.id)
+
+    return {"supplier_id": supplier.id, "name": supplier.name, "from_date": from_date, "to_date": to_date,
+            **supplier_metrics(pos)}

@@ -70,3 +70,67 @@ def test_delivered_at_is_naive_utc(api, engine, make_product):
     assert po.delivered_at.tzinfo is None
     assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - po.delivered_at) < timedelta(seconds=30)
     assert po.delivered_at >= po.timestamp  # same clock as the order timestamp
+
+
+def test_stocking_without_expiry_never_expires(api, engine, make_product, in_sync):
+    product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [("5", None, -9)])
+    po_id = delivered_po(api, product_id)
+    status, body = api("PUT", f"/purchase-orders/{po_id}/stock")
+    assert status == 200 and body["batch_expiry"] is None
+    with Session(engine) as session:
+        [batch] = session.exec(select(ProductBatch).where(ProductBatch.po_id == po_id)).all()
+    assert batch.expiry_date is None and batch.quantity == 10
+    assert in_sync(product_id) == 15
+    # never treated as expired: it can be sold and the daily check leaves it alone
+    assert api("POST", "/checkout/", {"product_id": product_id, "quantity": 15})[0] == 200
+    assert api("POST", "/system/daily-check")[1]["products"] == []
+
+
+# --- PO creation validation ---
+
+def create_po(api, product_id, quantity, unit_cost=1):
+    supplier_id = api("POST", "/suppliers/", {"name": "Vendor"})[1]["supplier_id"]
+    return api("POST", "/purchase-orders/", {"supplier_id": supplier_id, "product_id": product_id,
+                                             "quantity": quantity, "unit_cost": unit_cost})
+
+
+@pytest.mark.parametrize("quantity", [0, -1, "0.0001", "abc", None])
+def test_po_quantity_must_be_positive_with_three_decimals(api, make_product, quantity):
+    product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [])
+    assert create_po(api, product_id, quantity)[0] == 422
+
+
+def test_fractional_po_for_kg_product(api, engine, make_product, in_sync):
+    product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [])
+    status, body = create_po(api, product_id, "2.5", unit_cost="1.25")
+    assert status == 200 and body["expense"] == 3.13  # 3.125 rounded half-up
+    assert body["message"] == "Order placed for 2.5 kg of Rice. Awaiting delivery."
+    po_id = body["po_id"]
+    api("PUT", f"/purchase-orders/{po_id}/deliver")
+    assert api("PUT", f"/purchase-orders/{po_id}/stock")[1]["accepted_quantity"] == 2.5
+    assert in_sync(product_id) == 2.5
+
+
+def test_fractional_po_rejected_for_piece_product(api, engine, make_product):
+    product_id, _ = make_product("Eggs", StockUnit.PIECE, "0.50", [])
+    status, body = create_po(api, product_id, "1.5")
+    assert status == 422
+    assert body["detail"] == "Eggs is counted by the piece, so quantity must be a whole number."
+    with Session(engine) as session:
+        assert session.exec(select(PurchaseOrder)).all() == []
+
+
+def test_whole_po_quantity_with_trailing_zeros_for_piece_product(api, make_product):
+    product_id, _ = make_product("Eggs", StockUnit.PIECE, "0.50", [])
+    assert create_po(api, product_id, "12.000")[0] == 200
+
+
+def test_negative_unit_cost_rejected(api, make_product):
+    product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [])
+    assert create_po(api, product_id, 5, unit_cost=-0.01)[0] == 422
+
+
+def test_free_goods_allowed(api, make_product):
+    product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [])
+    status, body = create_po(api, product_id, 5, unit_cost=0)
+    assert status == 200 and body["expense"] == 0
