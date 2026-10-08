@@ -273,8 +273,8 @@ class Sale(SQLModel, table=True):
     __table_args__ = (Index("ix_sales_business_id_timestamp", "business_id", "timestamp"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    product_id: int = Field(index=True) # What was sold
-    user_id: int = Field(index=True)    # Who sold it (Ankit or Rahul)
+    product_id: int = Field(foreign_key="product.id", index=True) # What was sold
+    user_id: int = Field(foreign_key="users.id", index=True)       # Who sold it (Ankit or Rahul)
     business_id: str = Field(foreign_key="businessprofile.id") # Multi-tenant lock; indexed by ix_sales_business_id_timestamp
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
     total_price: Money = Field(max_digits=12, decimal_places=2)
@@ -941,8 +941,8 @@ class PurchaseOrder(SQLModel, table=True):
     __tablename__ = "purchase_order" 
     
     id: int | None = Field(default=None, primary_key=True)
-    supplier_id: int = Field(index=True)
-    product_id: int = Field(index=True)
+    supplier_id: int = Field(foreign_key="suppliers.id", index=True)
+    product_id: int = Field(foreign_key="product.id", index=True)
     business_id: str = Field(foreign_key="businessprofile.id", index=True)
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
     unit_cost: Money = Field(max_digits=12, decimal_places=2)

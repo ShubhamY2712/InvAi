@@ -10,6 +10,9 @@ os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["SECRET_KEY"] = "test-secret"
 
 import pytest
+from dotenv import dotenv_values
+from sqlalchemy import create_engine as sa_create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -170,3 +173,25 @@ def set_product_quantity(engine):
             session.add(product)
             session.commit()
     return _set
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def local_postgres_url() -> str | None:
+    """The DATABASE_URL from .env if it is a reachable Postgres server on this machine (conftest replaces the
+    environment's DATABASE_URL with SQLite, so .env is read directly)."""
+    url = dotenv_values(os.path.join(PROJECT_ROOT, ".env")).get("DATABASE_URL")
+    if not url:
+        return None
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "postgresql" or parsed.host not in ("localhost", "127.0.0.1"):
+        return None
+    try:
+        engine = sa_create_engine(parsed.set(database="postgres"), connect_args={"connect_timeout": 3})
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine.dispose()
+    except Exception:
+        return None
+    return url

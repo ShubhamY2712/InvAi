@@ -36,7 +36,8 @@ def reset() -> None:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
     engine = create_engine(url)
     with engine.begin() as conn:  # one transaction: any failure leaves the database as it was
-        # Drop every table that exists, including ones no longer in the models (and alembic_version)
+        # Drop every table that exists, including ones no longer in the models (and alembic_version).
+        # DROP TABLE doesn't fire the ledger's UPDATE/DELETE/TRUNCATE triggers; they go with the table.
         existing = MetaData()
         existing.reflect(conn)
         existing.drop_all(conn)
@@ -49,6 +50,16 @@ def reset() -> None:
             )).scalars().all()
             for name in enum_types:
                 conn.execute(text(f'DROP TYPE "{name}"'))
+
+            # Functions (e.g. the ledger's append-only trigger function) also outlive their tables.
+            # Skip any that belong to an extension.
+            functions = conn.execute(text(
+                "SELECT p.oid::regprocedure::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = current_schema() AND NOT EXISTS "
+                "(SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')"
+            )).scalars().all()
+            for signature in functions:
+                conn.execute(text(f"DROP FUNCTION {signature}"))
 
         # Rebuild through the migrations, inside this same transaction (migrations/env.py uses this connection)
         config.attributes["connection"] = conn

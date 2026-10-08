@@ -5,7 +5,7 @@ migrations in `migrations/versions/`. The app never creates or alters tables its
 compares the database's Alembic revision with the code's, and refuses to start if they differ:
 
 ```
-RuntimeError: Database schema is out of date. Run: alembic upgrade head (database: none; code: 13385b7b4ede)
+RuntimeError: Database schema is out of date. Run: alembic upgrade head (database: none; code: <head revision>)
 ```
 
 Alembic reads the database from `DATABASE_URL` (loaded from `.env`, like the app). The URL is never
@@ -83,5 +83,26 @@ alembic check                # confirm the schema matches the models
 - **Never edit a migration that has run anywhere else.** Write a new one. If two branches both add
   migrations, `alembic heads` shows two heads and the app refuses to start; join them with
   `alembic merge heads -m "merge"`.
+- **Timestamps are `timestamptz` and always UTC.** Declare datetime columns with
+  `sa_type=UTCDateTime` (and annotate them `UTCTimestamp`): the column type refuses naive datetimes and
+  hands values back as aware UTC whatever the session's time zone, and `UTCTimestamp` sends them with
+  `+00:00`. Use `utc_now()`, never `datetime.utcnow()`. Autogenerate writes `UTCDateTime` columns as
+  `sa.DateTime(timezone=True)` (a hook in `env.py`), so migrations never import `main`.
+- **Converting a column between `timestamp` and `timestamptz` needs `USING`.** A bare type change casts with
+  the session's `TimeZone`, which silently shifts every value (by 5h30m on a server set to India). Say how
+  to read the old value, as in `7086dfa92b45`:
+  `postgresql_using='"col" AT TIME ZONE 'UTC''` in both `upgrade()` and `downgrade()`.
+- **Autogenerate doesn't detect triggers or functions.** The ledger's append-only protection lives only in
+  migration `20ef20ef2e0a`: a `stock_movement_append_only()` function plus two triggers that reject `UPDATE`
+  and `DELETE` (per row) and `TRUNCATE` (per statement) on `stock_movement`. `alembic check` can't see them,
+  so `scripts/check_migrations.py` checks for them explicitly. If a future migration recreates or renames
+  `stock_movement`, it must recreate the triggers too.
+- **The ledger is append-only, in the database too.** Never fix a ledger entry in place: insert a correcting
+  entry. Even manual SQL gets *"stock_movement is an append-only ledger: UPDATE is not allowed"*. `DROP TABLE`
+  (as `scripts/reset_db.py` does) doesn't fire the triggers.
+- **Check for orphans before adding a foreign key.** Count the rows that point at nothing first, and stop
+  with a clear message if there are any (see `20ef20ef2e0a`), rather than letting `ALTER TABLE` fail on the
+  first bad row. On the old Neon data, sales whose product was hard-deleted (before products were
+  deactivated instead) will stop that migration: repoint or remove them, then run it again.
 - **SQLModel string columns** are rendered as `sqlmodel.sql.sqltypes.AutoString()`; the migration
   template already imports `sqlmodel` for this.

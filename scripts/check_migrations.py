@@ -4,7 +4,8 @@
 2. Runs `alembic check`: fails if the models have changes no migration covers.
 3. Builds a second scratch database with SQLModel.metadata.create_all and compares the two schemas
    (columns, types, nullability, defaults, constraints, indexes, enum types and labels, sequences).
-4. Runs `alembic downgrade base` on the first and checks nothing is left behind.
+4. Checks the database objects autogenerate can't see (the ledger's append-only triggers) exist at head.
+5. Runs `alembic downgrade base` on the first and checks nothing is left behind (tables, enums, functions).
 Both scratch databases are dropped at the end. Uses the server in DATABASE_URL, which must be local.
 
 Usage (from the project root):  python scripts/check_migrations.py
@@ -42,6 +43,23 @@ def schema_snapshot(engine) -> dict:
     }
     with engine.connect() as conn:
         return {name: sorted(tuple(map(str, row)) for row in conn.execute(text(sql)).all()) for name, sql in queries.items()}
+
+
+def functions(engine) -> list[str]:
+    with engine.connect() as conn:
+        return sorted(conn.execute(text(
+            "SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public'"
+        )).scalars())
+
+
+EXPECTED_TRIGGERS = {"stock_movement_no_update_or_delete", "stock_movement_no_truncate"}
+
+
+def triggers(engine) -> set[str]:
+    with engine.connect() as conn:
+        return set(conn.execute(text(
+            "SELECT tgname FROM pg_trigger WHERE tgrelid = 'stock_movement'::regclass AND NOT tgisinternal"
+        )).scalars())
 
 
 def tables(engine) -> list[str]:
@@ -103,14 +121,23 @@ def main() -> int:
             counts = ", ".join(f"{len(v)} {k}" for k, v in migrated.items())
             print(f"OK   upgrade head == create_all ({counts})")
 
-        # 4. Downgrade leaves nothing behind
+        # 4. What autogenerate can't compare: the append-only triggers on the ledger
+        found = triggers(migrated_engine)
+        if found == EXPECTED_TRIGGERS:
+            print(f"OK   append-only triggers present on stock_movement ({', '.join(sorted(found))})")
+        else:
+            problems.append(f"stock_movement triggers are {sorted(found)}, expected {sorted(EXPECTED_TRIGGERS)}")
+
+        # 5. Downgrade leaves nothing behind
         command.downgrade(cfg, "base")
         leftover_tables = [t for t in tables(migrated_engine) if t != "alembic_version"]
         leftover_enums = schema_snapshot(migrated_engine)["enums"]
-        if leftover_tables or leftover_enums:
-            problems.append(f"downgrade base left tables {leftover_tables} and enum types {leftover_enums}")
+        leftover_functions = functions(migrated_engine)
+        if leftover_tables or leftover_enums or leftover_functions:
+            problems.append(f"downgrade base left tables {leftover_tables}, enum types {leftover_enums} "
+                            f"and functions {leftover_functions}")
         else:
-            print("OK   downgrade base removes every table and enum type")
+            print("OK   downgrade base removes every table, enum type and function")
         migrated_engine.dispose(); created_engine.dispose()
     except Exception as exc:
         problems.append(f"{type(exc).__name__}: {exc}")
