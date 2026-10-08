@@ -105,6 +105,17 @@ class UserRole(str, enum.Enum):
     STAFF = "Staff"
     MANAGER = "Manager"
 
+def has_role(current_user: dict, *roles: UserRole) -> bool:
+    """Returns True if the token's role matches one of roles (case-insensitive). Never raises on bad token data."""
+    role = current_user.get("role") if isinstance(current_user, dict) else None
+    allowed = {r.value.lower() for r in roles}
+    return isinstance(role, str) and role.lower() in allowed
+
+def require_role(current_user: dict, *allowed_roles: UserRole, detail: str = "You do not have permission to perform this action.") -> None:
+    """Raises 403 unless the token's role matches one of allowed_roles (case-insensitive)."""
+    if not has_role(current_user, *allowed_roles):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
 
 import random
 
@@ -298,8 +309,7 @@ def add_product(
 ):
     
     # SECURITY CHECK
-    if current_user.get("role").lower() not in ["owner", "manager"]:
-        raise HTTPException(status_code=403, detail="Staff cannot create new products.")
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Staff cannot create new products.")
     
     with Session(engine) as session:
         # Create the database record, combining user data with the Bouncer's secure ID
@@ -343,8 +353,7 @@ def update_product(
 ):
     
     # SECURITY CHECK
-    if current_user.get("role").lower() not in ["owner", "manager"]:
-        raise HTTPException(status_code=403, detail="Staff cannot edit product details.")
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Staff cannot edit product details.")
     
     with Session(engine) as session:
         # 1. The Ultimate Security Check: Find the product, but ONLY if they own it
@@ -387,8 +396,7 @@ def delete_product(
 ):
     
     # SECURITY CHECK
-    if current_user.get("role").lower() != "owner":
-        raise HTTPException(status_code=403, detail="Only the Owner can delete products from the system.")
+    require_role(current_user, UserRole.OWNER, detail="Only the Owner can delete products from the system.")
     
     with Session(engine) as session:
         # 1. Search for the product using the ID AND the Business ID (The Multi-Tenant Lock)
@@ -429,11 +437,7 @@ def add_employee(
     current_user: dict = Depends(get_current_user) # THE BOUNCER
 ):
     # Optional Security: Only allow 'Owner' to add employees
-    if current_user["role"] != "Owner":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Only business owners can add employees."
-        )
+    require_role(current_user, UserRole.OWNER, detail="Only business owners can add employees.")
 
     with Session(engine) as session:
         # 1. Check if the username is already taken
@@ -594,11 +598,8 @@ def get_sales_history(current_user: dict = Depends(get_current_user)):
         clean_business_id = str(current_user["business_id"]).strip()
         clean_user_id = int(str(current_user["user_id"]).strip())
         
-        # Grab the role from the token and ensure it's uppercase
-        role = str(current_user.get("role", "")).upper()
-
         # The Logic Split: Owner vs Staff
-        if role == "OWNER" or role == "MANAGER":
+        if has_role(current_user, UserRole.OWNER, UserRole.MANAGER):
             # The Boss sees EVERYTHING for this specific business
             statement = select(Sale).where(Sale.business_id == clean_business_id)
         else:
@@ -768,8 +769,7 @@ def mark_po_delivered(
 @app.put("/purchase-orders/{po_id}/stock")
 def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Depends(get_current_user)):
     # SECURITY CHECK
-    if current_user.get("role").lower() not in ["owner", "manager"]:
-        raise HTTPException(status_code=403, detail="Staff cannot stock inventory.")
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Staff cannot stock inventory.")
         
     with Session(engine) as session:
         # 1. Get the PO
@@ -816,11 +816,7 @@ def manual_stock_adjustment(
     current_user: dict = Depends(get_current_user)
 ):
     # Updated Security Gate: Owner and Manager only
-    if current_user.get("role") not in ["owner", "manager"]:
-        raise HTTPException(
-            status_code=403, 
-            detail="Access Denied: Only the Owner or a Manager can manually adjust stock levels."
-        )
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Access Denied: Only the Owner or a Manager can manually adjust stock levels.")
 
     with Session(engine) as session:
         clean_business_id = str(current_user["business_id"]).strip()
@@ -847,7 +843,7 @@ def manual_stock_adjustment(
             "message": f"Manual audit completed for {product.name}",
             "previous_qty": old_qty,
             "new_qty": product.quantity,
-            "authorized_by": f"{current_user['username']} ({current_user['role']})"
+            "authorized_by": f"{current_user['user_id']} ({current_user['role']})"
         }
     
 
@@ -907,8 +903,7 @@ def get_low_stock_alerts(current_user: dict = Depends(get_current_user)):
 @app.post("/system/daily-check")
 def daily_inventory_health_check(current_user: dict = Depends(get_current_user)):
     # SECURITY CHECK: Only Owners/Managers can trigger system sweeps
-    if current_user.get("role").lower() not in ["owner", "manager"]:
-        raise HTTPException(status_code=403, detail="Unauthorized.")
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Unauthorized.")
 
     with Session(engine) as session:
         # 1. Find batches that expired today (or earlier) that still have items left in them
