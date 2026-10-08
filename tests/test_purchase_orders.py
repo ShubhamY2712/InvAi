@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlmodel import Session, select
 
-from main import ProductBatch, PurchaseOrder, StockUnit
+from app.models import ProductBatch, PurchaseOrder, StockUnit
 from conftest import day
 
 

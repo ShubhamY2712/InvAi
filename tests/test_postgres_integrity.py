@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-import main
+from app import db, models, security
 from conftest import asgi_request, day, local_postgres_url
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -181,12 +181,12 @@ def test_reset_db_works_with_the_triggers_in_place():
 
 def test_app_flows_on_postgres(monkeypatch):
     with scratch_database() as (url, engine):
-        monkeypatch.setattr(main, "engine", engine)
+        monkeypatch.setattr(db, "engine", engine)
         status, onboard = asgi_request("POST", "/onboard-business/", {
-            "business_name": "PG Shop", "category": main.BusinessCategory.RETAIL.value,
+            "business_name": "PG Shop", "category": models.BusinessCategory.RETAIL.value,
             "owner_username": "pgowner", "email": "pg@example.com", "password": "pw-123456"})
         assert status == 200
-        token = main.create_access_token({"sub": str(onboard["owner_user_id"]), "business_id": onboard["business_id"], "role": "Owner"})
+        token = security.create_access_token({"sub": str(onboard["owner_user_id"]), "business_id": onboard["business_id"], "role": "Owner"})
         api = lambda method, path, body=None: asgi_request(method, path, body, token)
 
         product = api("POST", "/products/", {"name": "Rice", "sku": "R", "price": 2, "quantity": 10, "unit": "kg",

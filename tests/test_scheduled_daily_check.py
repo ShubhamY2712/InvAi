@@ -9,8 +9,8 @@ import pytest
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine
 
-import main
-from main import BusinessCategory, BusinessProfile, MovementReason, StockUnit
+from app.services import daily_check
+from app.models import BusinessCategory, BusinessProfile, MovementReason, StockUnit
 from conftest import BUSINESS_ID, OTHER_BUSINESS_ID
 from scripts import run_daily_check as job
 
@@ -54,7 +54,7 @@ def test_clears_every_business_and_marks_entries_as_scheduled(engine, three_busi
 
 def test_one_failing_business_is_rolled_back_and_the_others_complete(engine, three_businesses, movements, in_sync,
                                                                      log_lines, monkeypatch):
-    real = main.run_daily_check
+    real = daily_check.run_daily_check
 
     def fails_after_changes(session, business_id, **kwargs):
         result = real(session, business_id, **kwargs)  # changes are made in the session...
@@ -62,7 +62,7 @@ def test_one_failing_business_is_rolled_back_and_the_others_complete(engine, thr
             raise RuntimeError("boom")                  # ...then the business fails before commit
         return result
 
-    monkeypatch.setattr(main, "run_daily_check", fails_after_changes)
+    monkeypatch.setattr(daily_check, "run_daily_check", fails_after_changes)
     assert job.run_all(engine) == 1
 
     failed = three_businesses[OTHER_BUSINESS_ID]

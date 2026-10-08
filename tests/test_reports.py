@@ -6,8 +6,8 @@ from decimal import Decimal
 import pytest
 from sqlmodel import Session
 
-import main
-from main import Sale, StockUnit
+from app import security
+from app.models import Sale, StockUnit
 from conftest import BUSINESS_ID, OTHER_BUSINESS_ID, asgi_request
 
 REPORTS = ["/reports/sales-summary", "/reports/top-products", "/reports/dead-stock"]
@@ -37,7 +37,7 @@ def ist_noon(day):
 
 @pytest.mark.parametrize("path", REPORTS)
 def test_staff_cannot_view_reports(engine, path):
-    staff_token = main.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
+    staff_token = security.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
     status, body = asgi_request("GET", path, token=staff_token)
     assert status == 403
     assert body["detail"] == "Only the Owner or a Manager can view reports."

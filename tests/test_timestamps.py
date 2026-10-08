@@ -7,15 +7,16 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import StatementError
 from sqlmodel import Session, select
 
-import main
-from main import Sale, StockUnit, UTCDateTime, ist_date, ist_day_start_utc
+from app import timeutils
+from app.models import Sale, StockUnit, UTCDateTime
+from app.timeutils import ist_date, ist_day_start_utc
 from conftest import BUSINESS_ID
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def test_utc_now_is_aware_utc():
-    assert main.utc_now().utcoffset() == timedelta(0)
+    assert timeutils.utc_now().utcoffset() == timedelta(0)
 
 
 def test_naive_datetimes_are_refused(engine, make_product):
@@ -67,7 +68,7 @@ def test_api_timestamps_carry_the_utc_offset(api, make_product):
                                               "quantity": 2, "unit_cost": 1})[1]["po_id"]
     cancelled_at = api("POST", f"/purchase-orders/{po_id}/cancel")[1]["cancelled_at"]
 
-    today = main.utc_now().astimezone(main.BUSINESS_TZ).date()
+    today = timeutils.utc_now().astimezone(timeutils.BUSINESS_TZ).date()
     movement_stamp = api("GET", f"/inventory/movements?from_date={today - timedelta(days=1)}&to_date={today}")[1]["movements"][0]["created_at"]
 
     for stamp in (sale_stamp, cancelled_at, movement_stamp):

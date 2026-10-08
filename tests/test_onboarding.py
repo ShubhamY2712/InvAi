@@ -1,17 +1,18 @@
 import re
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-import main
-from main import BusinessProfile, User, UserRole
+from app import db, models, security
+from app.models import BusinessProfile, User, UserRole
 from conftest import BUSINESS_ID, asgi_request
 
 BUSINESS_ID_PATTERN = re.compile(r"^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$")
 
 
 def onboard(**overrides):
-    body = {"business_name": "New Shop", "category": main.BusinessCategory.RETAIL.value,
+    body = {"business_name": "New Shop", "category": models.BusinessCategory.RETAIL.value,
             "owner_username": "newowner", "email": "new@example.com", "password": "pw-123456"}
     return asgi_request("POST", "/onboard-business/", {**body, **overrides})
 
@@ -31,13 +32,13 @@ def generated_ids(monkeypatch):
             value = queue.pop(0) if len(queue) > 1 or not repeat_last else queue[0]
             handed_out.append(value)
             return value
-        monkeypatch.setattr(main, "generate_business_id", fake)
+        monkeypatch.setattr(models, "generate_business_id", fake)
     install.handed_out = handed_out
     return install
 
 
 def test_generated_ids_are_8_chars_from_the_alphabet():
-    ids = [main.generate_business_id() for _ in range(500)]
+    ids = [models.generate_business_id() for _ in range(500)]
     assert all(BUSINESS_ID_PATTERN.match(i) for i in ids)
     assert len(set(ids)) == 500
 
@@ -50,7 +51,7 @@ def test_onboarding_creates_business_and_owner(engine):
         owner = session.get(User, body["owner_user_id"])
     assert owner.username == "newowner" and owner.role == UserRole.OWNER
     assert owner.business_id == body["business_id"]
-    assert main.verify_password("pw-123456", owner.hashed_password)
+    assert security.verify_password("pw-123456", owner.hashed_password)
 
 
 def test_owner_ids_come_from_the_sequence(engine):
@@ -100,5 +101,5 @@ def test_duplicate_email_is_409(engine, generated_ids):
 def test_duplicate_field_ignores_other_integrity_errors():
     class FakeOrig(Exception):
         pass
-    exc = main.IntegrityError("INSERT ...", {}, FakeOrig('insert or update on table "sales" violates foreign key constraint'))
-    assert main.duplicate_field(exc) is None
+    exc = IntegrityError("INSERT ...", {}, FakeOrig('insert or update on table "sales" violates foreign key constraint'))
+    assert db.duplicate_field(exc) is None

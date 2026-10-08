@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 from sqlmodel import Session
 
-from main import ProductBatch, StockUnit
+from app.models import ProductBatch, StockUnit
 from conftest import OTHER_BUSINESS_ID, day
 
 

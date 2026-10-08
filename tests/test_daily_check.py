@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from main import StockUnit
+from app.models import StockUnit
 from conftest import OTHER_BUSINESS_ID
 
 

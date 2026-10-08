@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from main import StockUnit
+from app.models import StockUnit
 from conftest import REAL_TODAY, day
 
 

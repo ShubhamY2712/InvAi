@@ -1,7 +1,7 @@
 import pytest
 from sqlmodel import Session
 
-from main import Product, StockUnit
+from app.models import Product, StockUnit
 from conftest import OTHER_BUSINESS_ID
 
 STOCK_MESSAGE = "Stock can't be changed here. Use purchase-order stocking, checkout, or a manual audit."

@@ -7,8 +7,8 @@ from decimal import Decimal
 import pytest
 from sqlmodel import Session
 
-import main
-from main import MovementReason, StockMovement, StockUnit
+from app import main, security
+from app.models import MovementReason, StockMovement, StockUnit
 from conftest import BUSINESS_ID, OTHER_BUSINESS_ID, REAL_TODAY, asgi_request, day
 
 R = MovementReason
@@ -241,7 +241,7 @@ def test_movements_exclude_other_business(api, make_product, add_movement):
 
 @pytest.mark.parametrize("path", ["/inventory/movements", "/reports/waste"])
 def test_staff_cannot_view(engine, path):
-    staff_token = main.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
+    staff_token = security.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
     assert asgi_request("GET", path, token=staff_token)[0] == 403
 
 

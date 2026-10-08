@@ -24,13 +24,16 @@ def _count(n: int, singular: str, plural: str) -> str:
 
 def run_all(engine=None) -> int:
     """Runs the daily check for every business. Returns the process exit code."""
-    import main
     from sqlmodel import Session, select
 
-    engine = engine or main.engine
+    from app import db
+    from app.models import BusinessProfile
+    from app.services import daily_check
+
+    engine = engine or db.engine
     try:
         with Session(engine) as session:
-            business_ids = session.exec(select(main.BusinessProfile.id).order_by(main.BusinessProfile.id)).all()
+            business_ids = session.exec(select(BusinessProfile.id).order_by(BusinessProfile.id)).all()
     except Exception as exc:
         log.error("could not list businesses: %s: %s", type(exc).__name__, exc)
         return 1
@@ -39,7 +42,7 @@ def run_all(engine=None) -> int:
     for business_id in business_ids:
         with Session(engine) as session:  # one transaction per business
             try:
-                result = main.run_daily_check(session, business_id, user_id=None, note=SCHEDULED_NOTE)
+                result = daily_check.run_daily_check(session, business_id, user_id=None, note=SCHEDULED_NOTE)
                 session.commit()
             except Exception as exc:
                 session.rollback()

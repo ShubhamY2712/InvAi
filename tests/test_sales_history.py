@@ -3,8 +3,8 @@ from decimal import Decimal
 
 from sqlmodel import Session
 
-import main
-from main import Sale, StockUnit, User, UserRole
+from app import security
+from app.models import Sale, StockUnit, User, UserRole
 from conftest import BUSINESS_ID, OTHER_BUSINESS_ID, asgi_request
 
 
@@ -42,7 +42,7 @@ def test_staff_breakdown_covers_only_their_own_sales(engine, make_product):
     rice, _ = make_product("Rice", StockUnit.KG, "2.00", [])
     add_sale(engine, eggs, "3", user_id=2)
     add_sale(engine, rice, "0.75", user_id=1)  # the owner's sale
-    staff = main.create_access_token({"sub": "2", "business_id": BUSINESS_ID, "role": "Staff"})
+    staff = security.create_access_token({"sub": "2", "business_id": BUSINESS_ID, "role": "Staff"})
     body = asgi_request("GET", "/sales/", token=staff)[1]
     assert body["items_sold_by_unit"] == {"piece": 3} and body["total_records"] == 1
 

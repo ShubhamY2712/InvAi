@@ -16,20 +16,21 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-import main
-from main import BusinessCategory, BusinessProfile, Product, ProductBatch, StockMovement, User, UserRole
+from app import db, main, models, security, timeutils
+from app.services import ledger
+from app.models import BusinessCategory, BusinessProfile, Product, ProductBatch, StockMovement, User, UserRole
 
 BUSINESS_ID = "1111"
 OTHER_BUSINESS_ID = "2222"
 
 # Far from the real date, so any code path still using date.today() for expiry would fail the tests
 FIXED_TODAY = date(2031, 3, 10)
-REAL_TODAY = main.today
+REAL_TODAY = timeutils.today
 
 
 @pytest.fixture(autouse=True)
 def fixed_today(monkeypatch):
-    monkeypatch.setattr(main, "today", lambda: FIXED_TODAY)
+    monkeypatch.setattr(timeutils, "today", lambda: FIXED_TODAY)
 
 
 def day(offset: int = 0) -> date:
@@ -41,7 +42,7 @@ def day(offset: int = 0) -> date:
 def engine(monkeypatch):
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(eng)
-    monkeypatch.setattr(main, "engine", eng)
+    monkeypatch.setattr(db, "engine", eng)
     with Session(eng) as session:
         session.add(BusinessProfile(id=BUSINESS_ID, business_name="Shop", category=BusinessCategory.RETAIL))
         session.add(BusinessProfile(id=OTHER_BUSINESS_ID, business_name="Other", category=BusinessCategory.RETAIL))
@@ -82,7 +83,7 @@ def asgi_request(method: str, path: str, body=None, token: str | None = None):
 @pytest.fixture
 def api(engine):
     """api(method, path, body=None) as the business owner."""
-    token = main.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Owner"})
+    token = security.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Owner"})
     return lambda method, path, body=None: asgi_request(method, path, body, token)
 
 
@@ -105,7 +106,7 @@ def make_product(engine):
                 session.add(batch)
                 session.flush()
                 batch_ids.append(batch.id)
-            main.record_movements(session, product, main.MovementReason.OPENING,
+            ledger.record_movements(session, product, models.MovementReason.OPENING,
                                   [(batch_id, Decimal(q)) for batch_id, (q, _, _) in zip(batch_ids, batches) if Decimal(q) != 0])
             session.commit()
             return product.id, batch_ids

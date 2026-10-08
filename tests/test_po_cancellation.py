@@ -5,8 +5,8 @@ from decimal import Decimal
 import pytest
 from sqlmodel import Session, select
 
-import main
-from main import ProductBatch, PurchaseOrder, StockUnit
+from app import security
+from app.models import ProductBatch, PurchaseOrder, StockUnit
 from conftest import BUSINESS_ID, OTHER_BUSINESS_ID, asgi_request
 
 
@@ -143,7 +143,7 @@ def test_cancelled_pos_excluded_from_scorecards(api, engine, rice):
 
 def test_staff_cannot_cancel(engine, rice, new_po):
     po_id = new_po(rice)
-    staff = main.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
+    staff = security.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
     status, body = asgi_request("POST", f"/purchase-orders/{po_id}/cancel", token=staff)
     assert status == 403 and body["detail"] == "Only the Owner or a Manager can cancel purchase orders."
     assert po_row(engine, po_id).status == "PENDING"
@@ -151,7 +151,7 @@ def test_staff_cannot_cancel(engine, rice, new_po):
 
 def test_manager_can_cancel(engine, rice, new_po):
     po_id = new_po(rice)
-    manager = main.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Manager"})
+    manager = security.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Manager"})
     assert asgi_request("POST", f"/purchase-orders/{po_id}/cancel", token=manager)[0] == 200
 
 

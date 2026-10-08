@@ -1,6 +1,6 @@
 # Database schema and migrations
 
-The schema is defined by the SQLModel classes in `main.py` and changed **only** through Alembic
+The schema is defined by the SQLModel classes in `app/models.py` and changed **only** through Alembic
 migrations in `migrations/versions/`. The app never creates or alters tables itself: at startup it
 compares the database's Alembic revision with the code's, and refuses to start if they differ:
 
@@ -9,11 +9,12 @@ RuntimeError: Database schema is out of date. Run: alembic upgrade head (databas
 ```
 
 Alembic reads the database from `DATABASE_URL` (loaded from `.env`, like the app). The URL is never
-written into `alembic.ini`. Importing the models also needs `SECRET_KEY`, so both must be set.
+written into `alembic.ini`. `migrations/env.py` imports only `app/models.py`, so Alembic needs `DATABASE_URL`
+but not `SECRET_KEY`.
 
 ## Everyday workflow
 
-1. **Change a model** in `main.py`.
+1. **Change a model** in `app/models.py`.
 2. **Generate a draft migration** against a database that is at the current head:
    ```
    alembic revision --autogenerate -m "add barcode to product"
@@ -28,7 +29,8 @@ written into `alembic.ini`. Importing the models also needs `SECRET_KEY`, so bot
 6. **Commit the model change and the migration together.**
 
 Useful commands: `alembic current` (the database's revision), `alembic history` (all revisions),
-`alembic downgrade -1` (undo the last one), `alembic upgrade head --sql` (print the SQL without running it).
+`alembic downgrade -1` (undo the last one), `alembic upgrade <revision> --sql` (print the SQL without running it).
+Offline `--sql` output stops at `20ef20ef2e0a`: its orphan check has to query the database, so run that one online.
 
 ## Local development
 
@@ -72,7 +74,7 @@ alembic check                # confirm the schema matches the models
   column as nullable, backfill it, then set `nullable=False` in the same migration.
 - **Server defaults and some type details aren't compared** (`compare_server_default` is off), so
   `alembic check` won't catch a missing `DEFAULT`. Review those by eye.
-- **Constraint names come from the naming convention** in `main.py`, which matches Postgres's own
+- **Constraint names come from the naming convention** in `app/models.py`, which matches Postgres's own
   defaults (`<table>_pkey`, `<table>_<column>_fkey`, `ix_<table>_<column>`). Keep it: migrations refer
   to constraints by name, and unnamed ones can't be dropped or altered later.
 - **Big indexes on busy tables:** `CREATE INDEX CONCURRENTLY` can't run inside a transaction. Wrap it:

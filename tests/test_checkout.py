@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from sqlmodel import Session, select
 
-from main import Sale, SaleBatchAllocation, StockUnit
+from app.models import Sale, SaleBatchAllocation, StockUnit
 from conftest import OTHER_BUSINESS_ID, day
 
 

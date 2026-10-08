@@ -12,7 +12,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.pool import StaticPool
 
-import main
+from app import db, main
 
 ROOT = Path(__file__).resolve().parent.parent
 HEAD = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini"))).get_current_head()
@@ -50,7 +50,7 @@ def start_app():
 def empty_db(monkeypatch):
     """A brand-new, empty SQLite database used as the app's database."""
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-    monkeypatch.setattr(main, "engine", eng)
+    monkeypatch.setattr(db, "engine", eng)
     yield eng
     eng.dispose()
 

@@ -1,8 +1,7 @@
 import pytest
 from sqlmodel import Session, select
 
-import main
-from main import Product, ProductBatch, StockUnit
+from app.models import Product, ProductBatch, StockUnit
 from conftest import day
 
 

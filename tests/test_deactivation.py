@@ -4,8 +4,8 @@ from datetime import timedelta
 import pytest
 from sqlmodel import Session, select
 
-import main
-from main import Product, ProductBatch, PurchaseOrder, StockUnit
+from app import security
+from app.models import Product, ProductBatch, PurchaseOrder, StockUnit
 from conftest import BUSINESS_ID, OTHER_BUSINESS_ID, REAL_TODAY, asgi_request
 
 
@@ -48,7 +48,7 @@ def make_po(api, product_id, deliver=False, stock=False):
 
 
 def as_role(role):
-    token = main.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": role})
+    token = security.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": role})
     return lambda method, path, body=None: asgi_request(method, path, body, token)
 
 

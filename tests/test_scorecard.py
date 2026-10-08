@@ -6,8 +6,9 @@ from decimal import Decimal
 import pytest
 from sqlmodel import Session, select
 
-import main
-from main import ProductBatch, PurchaseOrder, StockUnit
+from app import models, security
+from app.services import common
+from app.models import ProductBatch, PurchaseOrder, StockUnit
 from conftest import BUSINESS_ID, OTHER_BUSINESS_ID, REAL_TODAY, asgi_request, day
 
 
@@ -30,7 +31,7 @@ def make_po(engine):
         with Session(engine) as session:
             po = PurchaseOrder(supplier_id=supplier_id, product_id=product_id, business_id=business_id,
                                quantity=Decimal(quantity), unit_cost=Decimal(unit_cost),
-                               total_cost=main.round_money(Decimal(quantity) * Decimal(unit_cost)), status=status,
+                               total_cost=common.round_money(Decimal(quantity) * Decimal(unit_cost)), status=status,
                                timestamp=ordered, delivered_at=delivered, stocked_at=stocked, expected_delivery_date=expected,
                                received_quantity=Decimal(received if received is not None else quantity),
                                rejected_quantity=Decimal(rejected))
@@ -124,7 +125,7 @@ def test_short_delivery_with_rejections_closes_the_po(api, engine, rice, deliver
     assert po_row(engine, po_id).status == "STOCKED"
     assert [b.quantity for b in batches_from(engine, po_id)] == [6]
     [receipt] = [m for m in movements(rice) if m.po_id == po_id]
-    assert (receipt.reason, receipt.quantity_change, receipt.batch_id) == (main.MovementReason.PURCHASE_RECEIPT, 6, body["batch_id"])
+    assert (receipt.reason, receipt.quantity_change, receipt.batch_id) == (models.MovementReason.PURCHASE_RECEIPT, 6, body["batch_id"])
     assert in_sync(rice) == 11
 
 
@@ -305,7 +306,7 @@ def test_scorecards_for_all_suppliers(api, supplier, rice, make_po):
 
 @pytest.mark.parametrize("path", ["/suppliers/scorecards", "/suppliers/1/scorecard"])
 def test_staff_cannot_view_scorecards(engine, path):
-    staff = main.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
+    staff = security.create_access_token({"sub": "1", "business_id": BUSINESS_ID, "role": "Staff"})
     status, body = asgi_request("GET", path, token=staff)
     assert status == 403 and body["detail"] == "Only the Owner or a Manager can view supplier scorecards."
 
@@ -313,7 +314,7 @@ def test_staff_cannot_view_scorecards(engine, path):
 def test_other_business_suppliers_and_pos_are_invisible(api, engine, supplier, rice, make_po, make_product):
     mine = supplier("Mine")
     with Session(engine) as session:
-        theirs = main.Supplier(name="Theirs", business_id=OTHER_BUSINESS_ID)
+        theirs = models.Supplier(name="Theirs", business_id=OTHER_BUSINESS_ID)
         session.add(theirs); session.commit(); theirs_id = theirs.id
     their_product = make_product("Theirs", StockUnit.KG, "1.00", [], business_id=OTHER_BUSINESS_ID)[0]
     make_po(theirs_id, their_product, business_id=OTHER_BUSINESS_ID)

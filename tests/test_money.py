@@ -2,15 +2,15 @@ from decimal import Decimal
 
 import pytest
 
-import main
-from main import StockUnit
+from app.services import common
+from app.models import StockUnit
 
 
 @pytest.mark.parametrize("value, expected", [
     ("0.125", "0.13"), ("0.135", "0.14"), ("2.675", "2.68"), ("1.005", "1.01"), ("0.124", "0.12"), ("7", "7.00"),
 ])
 def test_round_money_is_half_up(value, expected):
-    assert main.round_money(Decimal(value)) == Decimal(expected)
+    assert common.round_money(Decimal(value)) == Decimal(expected)
 
 
 @pytest.fixture
