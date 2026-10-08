@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from typing import Annotated, Any, List
+from typing import Annotated, Any, List, Literal
 from pydantic import PlainSerializer
 import os
 from dotenv import load_dotenv
@@ -11,7 +11,10 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 import secrets
+from sqlalchemy import Date, Index, func, or_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.expression import FunctionElement
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
@@ -220,7 +223,9 @@ class Product(SQLModel, table=True):
 
 class Sale(SQLModel, table=True):
     __tablename__ = "sales"
-    
+    # Reports filter one business's sales by time range
+    __table_args__ = (Index("ix_sales_business_id_timestamp", "business_id", "timestamp"),)
+
     id: int | None = Field(default=None, primary_key=True)
     product_id: int = Field(index=True) # What was sold
     user_id: int = Field(index=True)    # Who sold it (Ankit or Rahul)
@@ -1198,3 +1203,181 @@ def daily_inventory_health_check(current_user: dict = Depends(get_current_user))
             "products": removed_per_product,
             "inconsistencies": inconsistencies
         }
+
+# --- REPORTS: SALES & TRENDS ---
+# Sale timestamps are naive UTC; every report date and daily bucket is an India (Asia/Kolkata) calendar day.
+
+class ist_date(FunctionElement):
+    """SQL expression for the India calendar date of a naive-UTC timestamp column."""
+    type = Date()
+    name = "ist_date"
+    inherit_cache = True
+
+@compiles(ist_date)
+def _ist_date_postgres(element, compiler, **kw):
+    return f"CAST(timezone('{BUSINESS_TZ.key}', timezone('UTC', {compiler.process(element.clauses, **kw)})) AS DATE)"
+
+@compiles(ist_date, "sqlite")
+def _ist_date_sqlite(element, compiler, **kw):
+    # SQLite has no time zone database; India has used a fixed +05:30 offset since 1945
+    return f"date({compiler.process(element.clauses, **kw)}, '+330 minutes')"
+
+def ist_day_start_utc(day: date) -> datetime:
+    """00:00 India time on day, as the naive UTC datetime sale timestamps are compared against."""
+    return datetime.combine(day, datetime.min.time(), tzinfo=BUSINESS_TZ).astimezone(timezone.utc).replace(tzinfo=None)
+
+REPORT_DEFAULT_DAYS = 30
+REPORT_MAX_SPAN_DAYS = 366
+
+def report_range(from_date: date | None, to_date: date | None) -> tuple[date, date]:
+    """Fills in the default range (the last 30 days including today) and validates it."""
+    to_date = to_date or today()
+    from_date = from_date or to_date - timedelta(days=REPORT_DEFAULT_DAYS - 1)
+    if from_date > to_date:
+        raise HTTPException(status_code=422, detail="from_date must be on or before to_date.")
+    if (to_date - from_date).days > REPORT_MAX_SPAN_DAYS:
+        raise HTTPException(status_code=422, detail=f"from_date and to_date can be at most {REPORT_MAX_SPAN_DAYS} days apart.")
+    return from_date, to_date
+
+def sales_in_range(business_id: str, from_date: date, to_date: date) -> tuple:
+    """WHERE conditions for this business's sales on India dates from_date..to_date inclusive."""
+    return (
+        Sale.business_id == business_id,
+        Sale.timestamp >= ist_day_start_utc(from_date),
+        Sale.timestamp < ist_day_start_utc(to_date + timedelta(days=1)),
+    )
+
+REPORT_ROLE_MESSAGE = "Only the Owner or a Manager can view reports."
+
+@app.get("/reports/sales-summary")
+def sales_summary(
+    from_date: date | None = Query(None, description="First India date (default: 29 days before to_date)"),
+    to_date: date | None = Query(None, description="Last India date, inclusive (default: today)"),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail=REPORT_ROLE_MESSAGE)
+    from_date, to_date = report_range(from_date, to_date)
+    in_range = sales_in_range(current_user["business_id"], from_date, to_date)
+    day = ist_date(Sale.timestamp)
+
+    with Session(engine) as session:
+        sales_count, revenue = session.exec(
+            select(func.count(Sale.id), func.coalesce(func.sum(Sale.total_price), 0)).where(*in_range)
+        ).one()
+        per_day = session.exec(
+            select(day, func.count(Sale.id), func.sum(Sale.total_price)).where(*in_range).group_by(day)
+        ).all()
+
+    by_day = {sale_day: (count, day_revenue) for sale_day, count, day_revenue in per_day}
+    daily = []
+    for offset in range((to_date - from_date).days + 1):  # zero-fill days without sales
+        current = from_date + timedelta(days=offset)
+        count, day_revenue = by_day.get(current, (0, 0))
+        daily.append({"date": current, "revenue": round_money(day_revenue), "sales_count": count})
+
+    revenue = round_money(revenue)
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "timezone": BUSINESS_TZ.key,
+        "total_revenue": revenue,
+        "sales_count": sales_count,
+        "average_sale_value": round_money(revenue / sales_count) if sales_count else None,
+        "daily": daily
+    }
+
+@app.get("/reports/top-products")
+def top_products(
+    from_date: date | None = Query(None, description="First India date (default: 29 days before to_date)"),
+    to_date: date | None = Query(None, description="Last India date, inclusive (default: today)"),
+    by: Literal["revenue", "quantity"] = Query("revenue"),
+    unit: StockUnit = Query(StockUnit.PIECE, description="With by=quantity, rank only products sold in this unit; ignored for revenue"),
+    limit: int = Query(10, ge=1, le=100),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail=REPORT_ROLE_MESSAGE)
+    from_date, to_date = report_range(from_date, to_date)
+
+    quantity_sold = func.sum(Sale.quantity)  # one product, one unit: never sums across units
+    revenue = func.sum(Sale.total_price)
+    ranking = (quantity_sold, revenue) if by == "quantity" else (revenue, quantity_sold)
+    conditions = [*sales_in_range(current_user["business_id"], from_date, to_date),
+                  Product.business_id == current_user["business_id"]]
+    if by == "quantity":
+        conditions.append(Product.unit == unit)  # quantities are only comparable within one unit
+
+    with Session(engine) as session:
+        rows = session.exec(
+            select(Product.id, Product.name, Product.unit, quantity_sold, revenue, func.count(Sale.id))
+            .join(Product, Product.id == Sale.product_id)
+            .where(*conditions)
+            .group_by(Product.id, Product.name, Product.unit)
+            .order_by(ranking[0].desc(), ranking[1].desc(), Product.id)
+            .limit(limit)
+        ).all()
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "by": by,
+        "unit": unit.value if by == "quantity" else None,
+        "products": [
+            {
+                "rank": rank,
+                "product_id": product_id,
+                "name": name,
+                "unit": unit.value,
+                "quantity_sold": Decimal(str(qty)).quantize(Decimal("0.001")),
+                "revenue": round_money(product_revenue),
+                "sales_count": count
+            }
+            for rank, (product_id, name, unit, qty, product_revenue, count) in enumerate(rows, start=1)
+        ]
+    }
+
+@app.get("/reports/dead-stock")
+def dead_stock(
+    days: int = Query(30, ge=1, le=3650, description="No sales in the last N India days, including today"),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail=REPORT_ROLE_MESSAGE)
+    business_id = current_user["business_id"]
+    current_date = today()
+    window_start = current_date - timedelta(days=days - 1)
+
+    last_sale = (
+        select(Sale.product_id, func.max(ist_date(Sale.timestamp)).label("last_sale_date"))
+        .where(Sale.business_id == business_id)
+        .group_by(Sale.product_id)
+        .subquery()
+    )
+
+    with Session(engine) as session:
+        rows = session.exec(
+            select(Product, last_sale.c.last_sale_date)
+            .outerjoin(last_sale, last_sale.c.product_id == Product.id)
+            .where(
+                Product.business_id == business_id,
+                Product.quantity > 0,
+                or_(last_sale.c.last_sale_date.is_(None), last_sale.c.last_sale_date < window_start)
+            )
+            .order_by((Product.quantity * Product.price).desc(), Product.id)
+        ).all()
+
+    return {
+        "days": days,
+        "since": window_start,
+        "products": [
+            {
+                "product_id": product.id,
+                "name": product.name,
+                "unit": product.unit.value,
+                "stock": product.quantity,
+                "price": product.price,
+                "stock_value": round_money(product.quantity * product.price),
+                "last_sale_date": last_sale_date,
+                "days_since_last_sale": (current_date - last_sale_date).days if last_sale_date else None
+            }
+            for product, last_sale_date in rows
+        ]
+    }
