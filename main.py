@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
@@ -117,6 +118,33 @@ def format_qty(quantity, unit: StockUnit | None = None) -> str:
     text = format(Decimal(str(quantity)).normalize(), "f")
     return f"{text} {unit.value}" if unit else text
 
+# Money: Decimal in Python, NUMERIC(12,2) in the database, a JSON number in responses
+Money = Annotated[Decimal, PlainSerializer(float, return_type=float, when_used="json")]
+
+def round_money(value) -> Decimal:
+    """Rounds to 2 decimal places, half-up (0.125 -> 0.13)."""
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+BUSINESS_TZ = ZoneInfo("Asia/Kolkata")
+
+def today() -> date:
+    """Current date in Asia/Kolkata, used for every expiry decision (needs tzdata on Windows)."""
+    return datetime.now(BUSINESS_TZ).date()
+
+def require_future_expiry(expiry_date: date | None) -> None:
+    """Raises 422 if expiry_date is today or earlier: checkout already treats such stock as expired."""
+    current_date = today()
+    if expiry_date is not None and expiry_date <= current_date:
+        raise HTTPException(
+            status_code=422,
+            detail=f"expiry_date must be after today ({current_date}). Stock expiring today or earlier is already expired and can't be sold."
+        )
+
+def utc_now() -> datetime:
+    """Current UTC time as a naive datetime. The timestamp columns are 'timestamp without time zone',
+    and Postgres would shift an aware value into the session's time zone before storing it."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 class UserRole(str, enum.Enum):
     OWNER = "Owner"
     STAFF = "Staff"
@@ -163,7 +191,7 @@ class Product(SQLModel, table=True):
     name: str = Field(index=True)
     sku: str = Field(index=True) # Stock Keeping Unit (Barcode equivalent)
     description: str | None = None
-    price: float
+    price: Money = Field(max_digits=12, decimal_places=2)
     quantity: Quantity = Field(default=Decimal("0"), max_digits=12, decimal_places=3)
     unit: StockUnit = Field(default=StockUnit.PIECE)
 
@@ -181,10 +209,10 @@ class Sale(SQLModel, table=True):
     user_id: int = Field(index=True)    # Who sold it (Ankit or Rahul)
     business_id: str = Field(index=True) # Multi-tenant lock
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
-    total_price: float
-    
+    total_price: Money = Field(max_digits=12, decimal_places=2)
+
     # Automatically stamps the exact millisecond the sale happens
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 class Supplier(SQLModel, table=True):
     __tablename__ = "suppliers"
@@ -218,9 +246,11 @@ class OnboardingRequest(SQLModel):
 class ProductCreate(SQLModel):
     name: str
     sku: str
-    price: float
+    price: Money = Field(max_digits=12, decimal_places=2)
     quantity: int = 0
     description: str | None = None
+    expiry_date: date | None = None  # expiry of the opening stock, if any
+    unit: StockUnit = StockUnit.PIECE
 
 class ProductUpdate(SQLModel):
     # Everything is optional because we only update what the frontend sends
@@ -313,7 +343,8 @@ def add_product(
     
     # SECURITY CHECK
     require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Staff cannot create new products.")
-    
+    require_future_expiry(product_data.expiry_date)
+
     with Session(engine) as session:
         # Create the database record, combining user data with the Bouncer's secure ID
         new_product = Product(
@@ -321,14 +352,28 @@ def add_product(
             sku=product_data.sku,
             price=product_data.price,
             quantity=product_data.quantity,
+            unit=product_data.unit,
             description=product_data.description,
             business_id=current_user["business_id"] # <-- THE MULTI-TENANT LOCK
         )
         
         session.add(new_product)
+        session.flush()  # assigns new_product.id for the opening batch
+
+        # Opening stock gets its own batch so batch totals always match Product.quantity
+        if new_product.quantity > 0:
+            session.add(ProductBatch(
+                product_id=new_product.id,
+                po_id=None,
+                business_id=current_user["business_id"],
+                quantity=new_product.quantity,
+                received_date=today(),
+                expiry_date=product_data.expiry_date
+            ))
+
         session.commit()
         session.refresh(new_product)
-        
+
         return {
             "success": True,
             "message": f"Successfully added {new_product.name} to inventory.",
@@ -475,12 +520,13 @@ def add_employee(
 
 @app.get("/alerts/expiring-soon/")
 def get_expiring_batches(
-    days: int = Query(7, ge=0, le=3650, description="How many days ahead to look"),
+    days: int = Query(7, ge=1, le=3650, description="How many days ahead to look"),
     current_user: dict = Depends(get_current_user)
 ):
-    """Returns this business's batches expiring between today and today + days, soonest first."""
-    today = date.today()
-    window_end = today + timedelta(days=days)
+    """Returns this business's batches expiring after today and up to today + days, soonest first.
+    A batch expiring today is already expired (same rule as checkout and the daily check)."""
+    current_date = today()
+    window_end = current_date + timedelta(days=days)
 
     with Session(engine) as session:
         statement = (
@@ -488,7 +534,7 @@ def get_expiring_batches(
             .join(Product, Product.id == ProductBatch.product_id)
             .where(
                 ProductBatch.business_id == current_user["business_id"],
-                ProductBatch.expiry_date >= today,
+                ProductBatch.expiry_date > current_date,
                 ProductBatch.expiry_date <= window_end,
                 ProductBatch.quantity > 0
             )
@@ -502,7 +548,7 @@ def get_expiring_batches(
                 "product_name": product_name,
                 "expiry_date": batch.expiry_date,
                 "quantity": batch.quantity,
-                "days_left": (batch.expiry_date - today).days
+                "days_left": (batch.expiry_date - current_date).days
             }
             for batch, product_name in rows
         ]
@@ -526,7 +572,7 @@ def get_my_profile(current_user: dict = Depends(get_current_user)):
 
 class CheckoutRequest(SQLModel):
     product_id: int
-    quantity: int
+    quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=3)
 
 @app.post("/checkout/")
 def process_checkout(
@@ -548,45 +594,90 @@ def process_checkout(
                 detail=f"User ID {clean_user_id} not found."
             )
 
-        # 2. Find the product (Also stripping the business_id just to be safe!)
+        # 2. Find and lock the product (Also stripping the business_id just to be safe!)
+        # Lock order is always product first, then its batches, so concurrent checkouts can't deadlock
         clean_business_id = str(current_user["business_id"]).strip()
-        
+
         statement = select(Product).where(
             Product.id == request.product_id,
             Product.business_id == clean_business_id
-        )
+        ).with_for_update()
         product = session.exec(statement).first()
 
         # 3. Validation: Does it exist?
         if not product:
             raise HTTPException(status_code=404, detail="Product not found in your inventory.")
 
-        # 4. Validation: Do we have enough stock?
-        if product.quantity < request.quantity:
+        # 4. Validation: piece products are sold in whole units only
+        if product.unit == StockUnit.PIECE and request.quantity != request.quantity.to_integral_value():
             raise HTTPException(
-                status_code=400, 
-                detail=f"Not enough stock! Only {format_qty(product.quantity, product.unit)} of {product.name} left."
+                status_code=422,
+                detail=f"{product.name} is sold by the piece, so quantity must be a whole number."
             )
 
-        # 5. Calculate Revenue
-        total_price = product.price * request.quantity
+        # 5. Lock the product's batches that still hold stock, in FIFO order
+        batches = session.exec(
+            select(ProductBatch).where(
+                ProductBatch.product_id == product.id,
+                ProductBatch.business_id == clean_business_id,
+                ProductBatch.quantity > 0
+            ).order_by(
+                ProductBatch.expiry_date.asc().nulls_last(),
+                ProductBatch.received_date,
+                ProductBatch.id
+            ).with_for_update()
+        ).all()
 
-        # 6. Perform the "Atomic" Action: Deduct Stock AND Create Receipt
-        product.quantity -= request.quantity
-        
+        # Same rule as /system/daily-check: a batch is expired from its expiry_date onward; NULL never expires
+        current_date = today()
+        sellable = [b for b in batches if b.expiry_date is None or b.expiry_date > current_date]
+        expired = [b for b in batches if b.expiry_date is not None and b.expiry_date <= current_date]
+        sellable_qty = sum((b.quantity for b in sellable), Decimal("0"))
+        expired_qty = sum((b.quantity for b in expired), Decimal("0"))
+
+        # 6. Validation: Do we have enough sellable stock?
+        if sellable_qty < request.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Not enough stock! Only {format_qty(sellable_qty, product.unit)} of {product.name} can be sold; "
+                    f"{format_qty(expired_qty, product.unit)} has expired and is awaiting disposal."
+                )
+            )
+
+        # 7. Create the receipt (flush to get its id for the allocations)
         new_sale = Sale(
             product_id=product.id,
             user_id=user.id,
             business_id=clean_business_id,
             quantity=request.quantity,
-            total_price=total_price
+            total_price=round_money(product.price * request.quantity)
         )
-        
-        # Add both to the session vault
-        session.add(product)
         session.add(new_sale)
+        session.flush()
 
-        # 7. COMMIT!
+        # 8. Deduct from batches in FIFO order, recording which batches the sale drew from
+        remaining = request.quantity
+        allocations = []
+        for batch in sellable:
+            if remaining == 0:
+                break
+            taken = min(batch.quantity, remaining)
+            batch.quantity -= taken
+            remaining -= taken
+            session.add(batch)
+            session.add(SaleBatchAllocation(
+                sale_id=new_sale.id,
+                batch_id=batch.id,
+                quantity=taken,
+                business_id=clean_business_id
+            ))
+            allocations.append({"batch_id": batch.id, "quantity": taken, "expiry_date": batch.expiry_date})
+
+        product.quantity -= request.quantity
+        session.add(product)
+
+        # 9. COMMIT! (stock, batches, sale and allocations together)
         session.commit()
         session.refresh(product)
         session.refresh(new_sale)
@@ -594,9 +685,10 @@ def process_checkout(
         return {
             "success": True,
             "message": f"Successfully sold {format_qty(request.quantity, product.unit)} of {product.name}",
-            "revenue": total_price,
+            "revenue": new_sale.total_price,
             "stock_remaining": product.quantity,
-            "sale_id": new_sale.id
+            "sale_id": new_sale.id,
+            "allocations": allocations
         }
     
 @app.get("/sales/")
@@ -669,7 +761,7 @@ class PurchaseOrderCreate(SQLModel):
     supplier_id: int
     product_id: int
     quantity: int
-    unit_cost: float
+    unit_cost: Money = Field(max_digits=12, decimal_places=2)
 
 class PurchaseOrder(SQLModel, table=True):
     __tablename__ = "purchase_order" 
@@ -679,12 +771,12 @@ class PurchaseOrder(SQLModel, table=True):
     product_id: int = Field(index=True)
     business_id: str = Field(index=True)
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
-    unit_cost: float
-    total_cost: float                    
+    unit_cost: Money = Field(max_digits=12, decimal_places=2)
+    total_cost: Money = Field(max_digits=12, decimal_places=2)
     status: str = Field(default="PENDING") 
     
     # --- The 3-Step AI Analytics Timestamps ---
-    timestamp: datetime = Field(default_factory=datetime.utcnow) # Step 1: Placed Order
+    timestamp: datetime = Field(default_factory=utc_now) # Step 1: Placed Order
     delivered_at: datetime | None = None                         # Step 2: Reached Loading Dock
     stocked_at: datetime | None = None                           # Step 3: Scanned to Shelf
 
@@ -717,7 +809,7 @@ def process_purchase_order(
             raise HTTPException(status_code=404, detail="Product not found in inventory.")
 
         # 3.  PO Receipt 
-        calculated_total_cost = request.quantity * request.unit_cost
+        calculated_total_cost = round_money(request.quantity * request.unit_cost)
         
         new_po = PurchaseOrder(
             supplier_id=supplier.id,
@@ -778,7 +870,8 @@ def mark_po_delivered(
 def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Depends(get_current_user)):
     # SECURITY CHECK
     require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Staff cannot stock inventory.")
-        
+    require_future_expiry(expiry_date)
+
     with Session(engine) as session:
         # 1. Get the PO
         po = session.get(PurchaseOrder, po_id)
@@ -797,7 +890,7 @@ def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Dep
             po_id=po.id,
             business_id=current_user["business_id"],
             quantity=po.quantity,
-            received_date=date.today(),
+            received_date=today(),
             expiry_date=expiry_date  # The user provides this when stocking
         )
         session.add(new_batch)
@@ -926,7 +1019,7 @@ def daily_inventory_health_check(current_user: dict = Depends(get_current_user))
         # 1. Find batches that expired today (or earlier) that still have items left in them
         statement = select(ProductBatch).where(
             ProductBatch.business_id == current_user["business_id"],
-            ProductBatch.expiry_date <= date.today(),
+            ProductBatch.expiry_date <= today(),
             ProductBatch.quantity > 0
         )
         expired_batches = session.exec(statement).all()
