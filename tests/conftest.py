@@ -116,3 +116,25 @@ def stock(engine):
             by_id = {b.id: b.quantity for b in batches}
             return product_qty, sum(by_id.values(), Decimal("0")), by_id
     return _stock
+
+
+@pytest.fixture
+def in_sync(stock):
+    """in_sync(product_id): asserts Product.quantity equals the sum of its batches and returns that quantity."""
+    def _check(product_id):
+        product_qty, batch_total, _ = stock(product_id)
+        assert product_qty == batch_total, f"Product.quantity {product_qty} != batch total {batch_total}"
+        return product_qty
+    return _check
+
+
+@pytest.fixture
+def set_product_quantity(engine):
+    """Forces Product.quantity out of line with its batches, to simulate drift from before batch tracking."""
+    def _set(product_id, quantity):
+        with Session(engine) as session:
+            product = session.get(Product, product_id)
+            product.quantity = Decimal(quantity)
+            session.add(product)
+            session.commit()
+    return _set

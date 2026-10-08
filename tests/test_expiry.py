@@ -41,7 +41,7 @@ def test_daily_check_clears_batches_expiring_today_and_earlier(api, make_product
     status, body = api("POST", "/system/daily-check")
     assert status == 200
     assert body["expired_batches_cleared"] == 2
-    assert body["total_items_removed_from_shelf"] == 2
+    assert "total_items_removed_from_shelf" not in body  # removed: it added up different units
     product_qty, batch_total, by_id = stock(product_id)
     assert by_id == {yesterday: 0, today_batch: 0, tomorrow: 2, no_expiry: 3}
     assert product_qty == batch_total == 5

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from typing import Annotated, List
+from typing import Annotated, Any, List
 from pydantic import PlainSerializer
 import os
 from dotenv import load_dotenv
@@ -254,9 +254,11 @@ class ProductCreate(SQLModel):
 
 class ProductUpdate(SQLModel):
     # Everything is optional because we only update what the frontend sends
-    quantity: int | None = None
+    quantity: Any = None  # never accepted; declared so any attempt gets a clear 422 instead of being silently ignored
+    name: str | None = None
     price: float | None = None
     description: str | None = None
+    unit: StockUnit | None = None
 
 @app.post("/onboard-business/")
 def onboard_new_business(request: OnboardingRequest):
@@ -403,30 +405,53 @@ def update_product(
     # SECURITY CHECK
     require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Staff cannot edit product details.")
     
+    # Stock is batch-tracked, so it only changes through stocking, checkout, or a manual audit
+    if "quantity" in product_update.model_fields_set:
+        raise HTTPException(
+            status_code=422,
+            detail="Stock can't be changed here. Use purchase-order stocking, checkout, or a manual audit."
+        )
+
     with Session(engine) as session:
         # 1. The Ultimate Security Check: Find the product, but ONLY if they own it
+        # Locked so no stock can arrive between the unit check below and the save
         statement = select(Product).where(
             Product.id == product_id,
             Product.business_id == current_user["business_id"]
-        )
+        ).with_for_update()
         product = session.exec(statement).first()
 
         # 2. If it doesn't exist (or they don't own it), reject them
         if not product:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
+                status_code=status.HTTP_404_NOT_FOUND,
                 detail="Product not found or access denied"
             )
 
-        # 3. Update only the fields the frontend specifically asked to change
-        if product_update.quantity is not None:
-            product.quantity = product_update.quantity
+        # 3. The unit can only change while nothing has ever been measured in it
+        if product_update.unit is not None and product_update.unit != product.unit:
+            has_batches = session.exec(
+                select(ProductBatch.id).where(ProductBatch.product_id == product.id).limit(1)
+            ).first() is not None
+            if product.quantity != 0 or has_batches:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Can't change the unit of {product.name} from {product.unit.value} to {product_update.unit.value}: "
+                        "it has stock or batch history, and those quantities would change meaning."
+                    )
+                )
+            product.unit = product_update.unit
+
+        # 4. Update only the fields the frontend specifically asked to change
+        if product_update.name is not None:
+            product.name = product_update.name
         if product_update.price is not None:
             product.price = product_update.price
         if product_update.description is not None:
             product.description = product_update.description
 
-        # 4. Save the changes to the vault
+        # 5. Save the changes to the vault
         session.add(product)
         session.commit()
         session.refresh(product)
@@ -616,17 +641,12 @@ def process_checkout(
             )
 
         # 5. Lock the product's batches that still hold stock, in FIFO order
-        batches = session.exec(
-            select(ProductBatch).where(
-                ProductBatch.product_id == product.id,
-                ProductBatch.business_id == clean_business_id,
-                ProductBatch.quantity > 0
-            ).order_by(
-                ProductBatch.expiry_date.asc().nulls_last(),
-                ProductBatch.received_date,
-                ProductBatch.id
-            ).with_for_update()
-        ).all()
+        batches = lock_batches_fifo(
+            session,
+            ProductBatch.product_id == product.id,
+            ProductBatch.business_id == clean_business_id,
+            ProductBatch.quantity > 0
+        )
 
         # Same rule as /system/daily-check: a batch is expired from its expiry_date onward; NULL never expires
         current_date = today()
@@ -852,7 +872,7 @@ def mark_po_delivered(
             raise HTTPException(status_code=400, detail=f"Cannot deliver. Order is currently {po.status}")
 
         po.status = "DELIVERED"
-        po.delivered_at = datetime.utcnow() # Stamps the exact millisecond the truck arrived
+        po.delivered_at = utc_now() # Stamps the exact millisecond the truck arrived (naive UTC, like timestamp)
         
         session.add(po)
         session.commit()
@@ -910,40 +930,105 @@ def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Dep
         }
     
 # --- MANUAL STOCK AUDIT (PROTECTED) ---
+def lock_batches_fifo(session: Session, *conditions) -> list["ProductBatch"]:
+    """Locks the matching batches (SELECT ... FOR UPDATE) in FIFO order: expiry_date ascending with NULL last,
+    then received_date, then id. Callers lock the product row(s) first, like checkout, so the lock order is
+    always product -> batches and these paths can't deadlock with each other."""
+    return session.exec(
+        select(ProductBatch).where(*conditions).order_by(
+            ProductBatch.expiry_date.asc().nulls_last(),
+            ProductBatch.received_date,
+            ProductBatch.id
+        ).with_for_update()
+    ).all()
+
 @app.put("/products/{product_id}/manual-audit")
 def manual_stock_adjustment(
-    product_id: int, 
-    new_quantity: int,
+    product_id: int,
+    new_quantity: Decimal = Query(..., ge=0, max_digits=12, decimal_places=3, description="The physically counted stock"),
+    expiry_date: date | None = Query(None, description="Expiry for an adjustment batch, if the count is higher than recorded"),
     current_user: dict = Depends(get_current_user)
 ):
     # Updated Security Gate: Owner and Manager only
     require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Access Denied: Only the Owner or a Manager can manually adjust stock levels.")
+    require_future_expiry(expiry_date)
 
     with Session(engine) as session:
         clean_business_id = str(current_user["business_id"]).strip()
-        
+
+        # 1. Lock the product, then its batches (same order as checkout)
         product = session.exec(
             select(Product).where(
-                Product.id == product_id, 
+                Product.id == product_id,
                 Product.business_id == clean_business_id
-            )
+            ).with_for_update()
         ).first()
 
         if not product:
             raise HTTPException(status_code=404, detail="Product not found.")
 
-        # Log the change (In a real audit, you'd want to know the old vs new)
+        if product.unit == StockUnit.PIECE and new_quantity != new_quantity.to_integral_value():
+            raise HTTPException(
+                status_code=422,
+                detail=f"{product.name} is counted by the piece, so new_quantity must be a whole number."
+            )
+
+        batches = lock_batches_fifo(
+            session,
+            ProductBatch.product_id == product.id,
+            ProductBatch.business_id == clean_business_id,
+            ProductBatch.quantity > 0
+        )
+
+        # 2. Bring the batches in line with the count. Measured against the batch total (not Product.quantity),
+        # so an audit also repairs a product whose stock had drifted from its batches.
         old_qty = product.quantity
+        batch_total = sum((b.quantity for b in batches), Decimal("0"))
+        batches_reduced = []
+        batch_created = None
+
+        if new_quantity < batch_total:
+            # Remove the shortfall in FIFO order; expired batches sort first, so they go first
+            to_remove = batch_total - new_quantity
+            for batch in batches:
+                if to_remove == 0:
+                    break
+                taken = min(batch.quantity, to_remove)
+                batch.quantity -= taken
+                to_remove -= taken
+                session.add(batch)
+                batches_reduced.append({
+                    "batch_id": batch.id,
+                    "quantity_removed": taken,
+                    "remaining": batch.quantity,
+                    "expiry_date": batch.expiry_date
+                })
+        elif new_quantity > batch_total:
+            # Found more than recorded: the surplus becomes its own adjustment batch (no purchase order)
+            adjustment = ProductBatch(
+                product_id=product.id,
+                po_id=None,
+                business_id=clean_business_id,
+                quantity=new_quantity - batch_total,
+                received_date=today(),
+                expiry_date=expiry_date
+            )
+            session.add(adjustment)
+            session.flush()
+            batch_created = {"batch_id": adjustment.id, "quantity": adjustment.quantity, "expiry_date": adjustment.expiry_date}
+
         product.quantity = new_quantity
-        
         session.add(product)
         session.commit()
-        
+
         return {
             "success": True,
             "message": f"Manual audit completed for {product.name}",
             "previous_qty": old_qty,
-            "new_qty": product.quantity,
+            "new_qty": new_quantity,
+            "unit": product.unit.value,
+            "batches_reduced": batches_reduced,
+            "batch_created": batch_created,
             "authorized_by": f"{current_user['user_id']} ({current_user['role']})"
         }
     
@@ -1015,38 +1100,78 @@ def daily_inventory_health_check(current_user: dict = Depends(get_current_user))
     # SECURITY CHECK: Only Owners/Managers can trigger system sweeps
     require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Unauthorized.")
 
+    business_id = current_user["business_id"]
+    # Same rule as checkout: a batch is expired from its expiry_date onward; NULL never expires
+    current_date = today()
+    expired_conditions = (
+        ProductBatch.business_id == business_id,
+        ProductBatch.expiry_date <= current_date,
+        ProductBatch.quantity > 0
+    )
+
     with Session(engine) as session:
-        # 1. Find batches that expired today (or earlier) that still have items left in them
-        statement = select(ProductBatch).where(
-            ProductBatch.business_id == current_user["business_id"],
-            ProductBatch.expiry_date <= today(),
-            ProductBatch.quantity > 0
-        )
-        expired_batches = session.exec(statement).all()
-        
-        items_removed = 0
-        
-        # 2. Process each expired batch
-        for batch in expired_batches:
-            # Find the main product on the shelf
-            product = session.get(Product, batch.product_id)
-            if product:
-                # Remove the spoiled amount from the main sellable inventory
-                product.quantity -= batch.quantity
-                if product.quantity < 0:
-                    product.quantity = 0  # Safety net to prevent negative inventory
-                session.add(product)
-                
-            # "Trash" the batch quantity so the sweeper doesn't count it again tomorrow
-            items_removed += batch.quantity
-            batch.quantity = 0 
-            session.add(batch)
-            
+        # 1. Which products have expired stock left? (read only; rechecked under lock below)
+        product_ids = session.exec(
+            select(ProductBatch.product_id).where(*expired_conditions).distinct()
+        ).all()
+
+        # 2. Lock those products in id order, then their expired batches, so this can't deadlock with checkout
+        products = session.exec(
+            select(Product).where(Product.id.in_(product_ids), Product.business_id == business_id)
+            .order_by(Product.id).with_for_update()
+        ).all()
+        batches = lock_batches_fifo(session, ProductBatch.product_id.in_(product_ids), *expired_conditions)
+
+        removed_per_product = []
+        inconsistencies = []
+        batches_cleared = 0
+
+        # 3. Dispose of each product's expired batches
+        for product in products:
+            expired = [b for b in batches if b.product_id == product.id]
+            if not expired:
+                continue  # sold or cleared between the read and the lock
+            expired_qty = sum((b.quantity for b in expired), Decimal("0"))
+
+            # Recorded stock can't cover what's in its own expired batches: change nothing and report it
+            if expired_qty > product.quantity:
+                inconsistencies.append({
+                    "product_id": product.id,
+                    "product_name": product.name,
+                    "unit": product.unit.value,
+                    "stock": product.quantity,
+                    "expired_in_batches": expired_qty,
+                    "message": (
+                        f"{product.name}: recorded stock is {format_qty(product.quantity, product.unit)} but "
+                        f"{format_qty(expired_qty, product.unit)} is in expired batches. Nothing was changed; "
+                        "run a manual audit to correct it."
+                    )
+                })
+                continue
+
+            for batch in expired:
+                batch.quantity = Decimal("0")
+                session.add(batch)
+            product.quantity -= expired_qty
+            session.add(product)
+
+            batches_cleared += len(expired)
+            removed_per_product.append({
+                "product_id": product.id,
+                "product_name": product.name,
+                "removed": expired_qty,
+                "unit": product.unit.value,
+                "removed_display": format_qty(expired_qty, product.unit),
+                "batches_cleared": [b.id for b in expired],
+                "stock_remaining": product.quantity
+            })
+
         # Save all changes to the database
         session.commit()
-        
+
         return {
             "message": "Daily health check complete.",
-            "expired_batches_cleared": len(expired_batches),
-            "total_items_removed_from_shelf": items_removed
+            "expired_batches_cleared": batches_cleared,
+            "products": removed_per_product,
+            "inconsistencies": inconsistencies
         }

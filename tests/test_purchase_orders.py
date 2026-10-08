@@ -61,3 +61,13 @@ def test_stocking_accepts_expiry_tomorrow(api, engine, make_product):
     product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [("5", None, -9)])
     po_id = delivered_po(api, product_id)
     assert api("PUT", f"/purchase-orders/{po_id}/stock?expiry_date={day(1)}")[0] == 200
+
+
+def test_delivered_at_is_naive_utc(api, engine, make_product):
+    product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [("5", None, -9)])
+    po_id = delivered_po(api, product_id)
+    with Session(engine) as session:
+        po = session.get(PurchaseOrder, po_id)
+    assert po.delivered_at.tzinfo is None
+    assert abs(datetime.now(timezone.utc).replace(tzinfo=None) - po.delivered_at) < timedelta(seconds=30)
+    assert po.delivered_at >= po.timestamp  # same clock as the order timestamp
