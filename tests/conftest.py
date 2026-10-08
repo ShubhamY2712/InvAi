@@ -8,6 +8,7 @@ from decimal import Decimal
 # main reads these at import time, and its load_dotenv() never overrides variables that are already set
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["SECRET_KEY"] = "test-secret"
+os.environ["CORS_ORIGINS"] = ""  # tests that need CORS build their own app (tests/test_cors.py)
 
 import pytest
 from dotenv import dotenv_values

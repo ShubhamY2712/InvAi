@@ -5,13 +5,37 @@
 ```
 python -m venv venv && venv\Scripts\activate      # or source venv/bin/activate
 pip install -r requirements.txt
-# .env needs DATABASE_URL and SECRET_KEY
+copy .env.example .env                             # cp on macOS/Linux; then fill in real values
 alembic upgrade head                               # the app refuses to start on an out-of-date schema
 uvicorn app.main:app --reload
 ```
 
 For a fresh local database: `python scripts/reset_db.py` (local only; drops everything and migrates to head).
 Schema changes are covered in [DATABASE.md](DATABASE.md).
+
+## Settings (`.env`)
+
+Every setting the app reads is listed, with a placeholder and a comment, in the committed `.env.example`.
+`.env` itself is git-ignored and must never be committed.
+
+| Setting | Used for |
+|---|---|
+| `DATABASE_URL` | Postgres connection for the app, Alembic and the scripts |
+| `SECRET_KEY` | Signs login tokens; the app won't start without it |
+| `CORS_ORIGINS` | Browser origins allowed to call the API (see below) |
+
+## CORS
+
+`CORS_ORIGINS` is a comma-separated list of exact origins, e.g. `http://localhost:3000,https://app.example.com`
+(scheme, host and port; no path, and a trailing `/` is ignored).
+
+- **Empty or unset:** no cross-origin requests are allowed. Same-origin requests and non-browser clients are unaffected.
+- **`*` is refused:** the app won't start if the value contains `*` anywhere. List every origin explicitly.
+- Allowed methods: `GET, POST, PUT, PATCH, DELETE`. Allowed request headers: `Authorization, Content-Type`.
+- `allow_credentials` is off: the frontend sends the token in the `Authorization` header, not a cookie.
+- A refused preflight gets a 400 with no `Access-Control-*` headers at all.
+
+Remember to add the frontend's production origin to `CORS_ORIGINS` when deploying.
 
 ## Layout
 

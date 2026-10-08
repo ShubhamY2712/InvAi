@@ -15,3 +15,13 @@ def database_url() -> str | None:
 
 def secret_key() -> str | None:
     return os.getenv("SECRET_KEY")
+
+
+def cors_origins() -> list[str]:
+    """Origins allowed to call the API from a browser, from CORS_ORIGINS (comma-separated).
+    Empty or unset allows no cross-origin requests. A "*" anywhere is refused: list origins explicitly."""
+    raw = os.getenv("CORS_ORIGINS", "")
+    if "*" in raw:
+        raise RuntimeError('CORS_ORIGINS must not contain "*"; list the allowed origins explicitly.')
+    # Browsers send Origin without a trailing slash, so "http://localhost:3000/" would never match as written
+    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]

@@ -2,11 +2,30 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.datastructures import Headers
+from starlette.responses import Response
 
-from app import db
+from app import config, db
 from app.errors import ServiceError
 from app.routers import auth, inventory, products, purchase_orders, reports, sales, suppliers
+
+# Auth uses the Authorization header (no cookies), so credentials stay off
+CORS_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+CORS_HEADERS = ["Authorization", "Content-Type"]
+
+
+class StrictCORSMiddleware(CORSMiddleware):
+    """Starlette's CORS middleware, except a refused preflight carries no Access-Control-* headers at all
+    (Starlette still lists the allowed methods and headers on its 400)."""
+
+    def preflight_response(self, request_headers: Headers) -> Response:
+        response = super().preflight_response(request_headers)
+        if response.status_code != 200:
+            for name in [key for key in response.headers if key.lower().startswith("access-control-")]:
+                del response.headers[name]
+        return response
 
 
 @asynccontextmanager
@@ -15,14 +34,26 @@ async def lifespan(app: FastAPI):
     db.check_schema_is_current(db.engine)
     yield
 
-app = FastAPI(lifespan=lifespan)
 
-
-@app.exception_handler(ServiceError)
 async def service_error_response(request: Request, exc: ServiceError) -> JSONResponse:
     """Services raise app.errors exceptions; they become the same {"detail": ...} responses as HTTPException."""
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-for module in (auth, products, inventory, sales, suppliers, purchase_orders, reports):
-    app.include_router(module.router)
+def create_app() -> FastAPI:
+    """Builds the app. CORS_ORIGINS is read here, so a "*" in it stops the app before it starts."""
+    application = FastAPI(lifespan=lifespan)
+    application.add_middleware(
+        StrictCORSMiddleware,
+        allow_origins=config.cors_origins(),
+        allow_credentials=False,
+        allow_methods=CORS_METHODS,
+        allow_headers=CORS_HEADERS,
+    )
+    application.add_exception_handler(ServiceError, service_error_response)
+    for module in (auth, products, inventory, sales, suppliers, purchase_orders, reports):
+        application.include_router(module.router)
+    return application
+
+
+app = create_app()
