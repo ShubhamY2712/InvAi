@@ -259,3 +259,10 @@ def test_sales_has_business_and_timestamp_index(engine):
     from sqlalchemy import inspect
     indexes = {ix["name"]: ix["column_names"] for ix in inspect(engine).get_indexes("sales")}
     assert indexes["ix_sales_business_id_timestamp"] == ["business_id", "timestamp"]
+
+
+def test_sales_has_no_redundant_business_id_index(engine):
+    from sqlalchemy import inspect
+    names = {ix["name"] for ix in inspect(engine).get_indexes("sales")}
+    assert "ix_sales_business_id" not in names
+    assert "ix_sales_business_id_timestamp" in names

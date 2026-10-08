@@ -229,7 +229,7 @@ class Sale(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     product_id: int = Field(index=True) # What was sold
     user_id: int = Field(index=True)    # Who sold it (Ankit or Rahul)
-    business_id: str = Field(foreign_key="businessprofile.id", index=True) # Multi-tenant lock
+    business_id: str = Field(foreign_key="businessprofile.id") # Multi-tenant lock; indexed by ix_sales_business_id_timestamp
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
     total_price: Money = Field(max_digits=12, decimal_places=2)
 
