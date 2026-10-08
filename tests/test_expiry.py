@@ -35,7 +35,7 @@ def test_expiring_soon_days_range(api, days, expected_status):
     assert api("GET", f"/alerts/expiring-soon/?days={days}")[0] == expected_status
 
 
-def test_daily_check_clears_batches_expiring_today_and_earlier(api, make_product, stock):
+def test_daily_check_clears_batches_expiring_today_and_earlier(api, make_product, stock, in_sync):
     product_id, [yesterday, today_batch, tomorrow, no_expiry] = make_product(
         "Milk", StockUnit.LITRE, "1.00", [("1.5", -1, -9), ("0.5", 0, -9), ("2", 1, -9), ("3", None, -9)])
     status, body = api("POST", "/system/daily-check")
@@ -45,6 +45,7 @@ def test_daily_check_clears_batches_expiring_today_and_earlier(api, make_product
     product_qty, batch_total, by_id = stock(product_id)
     assert by_id == {yesterday: 0, today_batch: 0, tomorrow: 2, no_expiry: 3}
     assert product_qty == batch_total == 5
+    in_sync(product_id)
 
 
 def test_checkout_alerts_and_daily_check_agree_on_a_batch_expiring_today(api, make_product, stock):

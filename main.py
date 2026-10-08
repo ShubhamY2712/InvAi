@@ -399,14 +399,18 @@ def add_product(
 
         # Opening stock gets its own batch so batch totals always match Product.quantity
         if new_product.quantity > 0:
-            session.add(ProductBatch(
+            opening_batch = ProductBatch(
                 product_id=new_product.id,
                 po_id=None,
                 business_id=current_user["business_id"],
                 quantity=new_product.quantity,
                 received_date=today(),
                 expiry_date=product_data.expiry_date
-            ))
+            )
+            session.add(opening_batch)
+            session.flush()  # assigns opening_batch.id for the ledger
+            record_movements(session, new_product, MovementReason.OPENING,
+                             [(opening_batch.id, new_product.quantity)], user_id=acting_user_id(current_user))
 
         session.commit()
         session.refresh(new_product)
@@ -730,8 +734,11 @@ def process_checkout(
 
         product.quantity -= request.quantity
         session.add(product)
+        record_movements(session, product, MovementReason.SALE,
+                         [(a["batch_id"], -a["quantity"]) for a in allocations],
+                         sale_id=new_sale.id, user_id=user.id)
 
-        # 9. COMMIT! (stock, batches, sale and allocations together)
+        # 9. COMMIT! (stock, batches, sale, allocations and ledger together)
         session.commit()
         session.refresh(product)
         session.refresh(new_sale)
@@ -943,13 +950,16 @@ def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Dep
             expiry_date=expiry_date  # The user provides this when stocking
         )
         session.add(new_batch)
-        
+        session.flush()  # assigns new_batch.id for the ledger
+
         # 4. Update the main Product total quantity
         product = session.get(Product, po.product_id)
         if product:
             product.quantity += po.quantity
             session.add(product)
-            
+            record_movements(session, product, MovementReason.PURCHASE_RECEIPT, [(new_batch.id, po.quantity)],
+                             po_id=po.id, user_id=acting_user_id(current_user))
+
         session.add(po)
         session.commit()
         
@@ -976,6 +986,7 @@ def manual_stock_adjustment(
     product_id: int,
     new_quantity: Decimal = Query(..., ge=0, max_digits=12, decimal_places=3, description="The physically counted stock"),
     expiry_date: date | None = Query(None, description="Expiry for an adjustment batch, if the count is higher than recorded"),
+    note: str | None = Query(None, max_length=500, description="Why the count changed; stored on the ledger entries"),
     current_user: dict = Depends(get_current_user)
 ):
     # Updated Security Gate: Owner and Manager only
@@ -1047,6 +1058,13 @@ def manual_stock_adjustment(
 
         product.quantity = new_quantity
         session.add(product)
+        refs = {"user_id": acting_user_id(current_user), "note": note}
+        if batches_reduced:
+            record_movements(session, product, MovementReason.AUDIT_DECREASE,
+                             [(b["batch_id"], -b["quantity_removed"]) for b in batches_reduced], **refs)
+        if batch_created:
+            record_movements(session, product, MovementReason.AUDIT_INCREASE,
+                             [(batch_created["batch_id"], batch_created["quantity"])], **refs)
         session.commit()
 
         return {
@@ -1082,6 +1100,62 @@ class SaleBatchAllocation(SQLModel, table=True):
     batch_id: int = Field(foreign_key="product_batch.id", index=True)
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
     business_id: str = Field(foreign_key="businessprofile.id", index=True)
+
+
+# --- STOCK MOVEMENT LEDGER (append-only: nothing updates or deletes entries) ---
+
+class MovementReason(str, Enum):
+    OPENING = "opening"
+    PURCHASE_RECEIPT = "purchase_receipt"
+    SALE = "sale"
+    AUDIT_INCREASE = "audit_increase"
+    AUDIT_DECREASE = "audit_decrease"
+    EXPIRY_DISPOSAL = "expiry_disposal"
+
+
+class StockMovement(SQLModel, table=True):
+    """One entry per batch touched by a stock change. For every batch the entries sum to its quantity,
+    and for every product they sum to Product.quantity."""
+    __tablename__ = "stock_movement"
+    __table_args__ = (Index("ix_stock_movement_business_product_created", "business_id", "product_id", "created_at"),)
+    id: int | None = Field(default=None, primary_key=True)
+    business_id: str = Field(foreign_key="businessprofile.id")
+    product_id: int = Field(foreign_key="product.id")
+    batch_id: int = Field(foreign_key="product_batch.id")
+    quantity_change: Quantity = Field(max_digits=12, decimal_places=3)  # signed: + into stock, - out of stock
+    reason: MovementReason
+    sale_id: int | None = Field(default=None, foreign_key="sales.id")
+    po_id: int | None = Field(default=None, foreign_key="purchase_order.id")
+    user_id: int | None = Field(default=None, foreign_key="users.id")
+    note: str | None = None
+    product_quantity_after: Quantity = Field(max_digits=12, decimal_places=3)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+def acting_user_id(current_user: dict) -> int | None:
+    """The token's user id as an int (None if the token's subject isn't numeric)."""
+    try:
+        return int(current_user["user_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def record_movements(session: Session, product: "Product", reason: MovementReason, changes, **refs) -> None:
+    """Appends one StockMovement per (batch_id, quantity_change) in changes, in order, to the caller's transaction.
+    Call after product.quantity holds its final value: product_quantity_after runs forward from the quantity
+    before these changes, so the last entry always equals Product.quantity. refs: sale_id, po_id, user_id, note."""
+    running = Decimal(str(product.quantity)) - sum((Decimal(str(change)) for _, change in changes), Decimal("0"))
+    for batch_id, change in changes:
+        running += Decimal(str(change))
+        session.add(StockMovement(
+            business_id=product.business_id,
+            product_id=product.id,
+            batch_id=batch_id,
+            quantity_change=change,
+            reason=reason,
+            product_quantity_after=running,
+            **refs
+        ))
 
 
 @app.get("/products/{product_id}/batches")
@@ -1177,11 +1251,14 @@ def daily_inventory_health_check(current_user: dict = Depends(get_current_user))
                 })
                 continue
 
+            disposals = [(batch.id, -batch.quantity) for batch in expired]  # captured before zeroing
             for batch in expired:
                 batch.quantity = Decimal("0")
                 session.add(batch)
             product.quantity -= expired_qty
             session.add(product)
+            record_movements(session, product, MovementReason.EXPIRY_DISPOSAL, disposals,
+                             user_id=acting_user_id(current_user))
 
             batches_cleared += len(expired)
             removed_per_product.append({
@@ -1379,5 +1456,105 @@ def dead_stock(
                 "days_since_last_sale": (current_date - last_sale_date).days if last_sale_date else None
             }
             for product, last_sale_date in rows
+        ]
+    }
+
+
+# --- STOCK MOVEMENT HISTORY & WASTE ---
+
+def movements_in_range(business_id: str, from_date: date, to_date: date) -> tuple:
+    """WHERE conditions for this business's ledger entries on India dates from_date..to_date inclusive."""
+    return (
+        StockMovement.business_id == business_id,
+        StockMovement.created_at >= ist_day_start_utc(from_date),
+        StockMovement.created_at < ist_day_start_utc(to_date + timedelta(days=1)),
+    )
+
+@app.get("/inventory/movements")
+def list_stock_movements(
+    product_id: int | None = Query(None),
+    reason: MovementReason | None = Query(None),
+    from_date: date | None = Query(None, description="First India date (default: 29 days before to_date)"),
+    to_date: date | None = Query(None, description="Last India date, inclusive (default: today)"),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Only the Owner or a Manager can view stock movements.")
+    from_date, to_date = report_range(from_date, to_date)
+
+    conditions = [*movements_in_range(current_user["business_id"], from_date, to_date)]
+    if product_id is not None:
+        conditions.append(StockMovement.product_id == product_id)
+    if reason is not None:
+        conditions.append(StockMovement.reason == reason)
+
+    with Session(engine) as session:
+        rows = session.exec(
+            select(StockMovement, Product.name, Product.unit)
+            .join(Product, Product.id == StockMovement.product_id)
+            .where(*conditions)
+            .order_by(StockMovement.created_at.desc(), StockMovement.id.desc())
+            .limit(limit)
+        ).all()
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "count": len(rows),
+        "movements": [
+            {
+                "id": m.id,
+                "created_at": m.created_at.replace(tzinfo=timezone.utc),  # stored as naive UTC; sent with its offset
+                "product_id": m.product_id,
+                "product_name": name,
+                "unit": unit.value,
+                "batch_id": m.batch_id,
+                "quantity_change": m.quantity_change,
+                "reason": m.reason.value,
+                "product_quantity_after": m.product_quantity_after,
+                "sale_id": m.sale_id,
+                "po_id": m.po_id,
+                "user_id": m.user_id,
+                "note": m.note
+            }
+            for m, name, unit in rows
+        ]
+    }
+
+@app.get("/reports/waste")
+def waste_report(
+    from_date: date | None = Query(None, description="First India date (default: 29 days before to_date)"),
+    to_date: date | None = Query(None, description="Last India date, inclusive (default: today)"),
+    current_user: dict = Depends(get_current_user)
+):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail=REPORT_ROLE_MESSAGE)
+    from_date, to_date = report_range(from_date, to_date)
+    disposals = (*movements_in_range(current_user["business_id"], from_date, to_date),
+                 StockMovement.reason == MovementReason.EXPIRY_DISPOSAL)
+    disposed = -func.sum(StockMovement.quantity_change)  # one product, one unit: never sums across units
+
+    with Session(engine) as session:
+        total_entries = session.exec(select(func.count(StockMovement.id)).where(*disposals)).one()
+        rows = session.exec(
+            select(Product.id, Product.name, Product.unit, disposed, func.count(StockMovement.id))
+            .join(Product, Product.id == StockMovement.product_id)
+            .where(*disposals)
+            .group_by(Product.id, Product.name, Product.unit)
+            .order_by(Product.name, Product.id)
+        ).all()
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "total_entries": total_entries,
+        "products": [
+            {
+                "product_id": product_id,
+                "name": name,
+                "unit": unit.value,
+                "quantity_disposed": Decimal(str(quantity)).quantize(Decimal("0.001")),
+                "entries": entries
+            }
+            for product_id, name, unit, quantity, entries in rows
         ]
     }

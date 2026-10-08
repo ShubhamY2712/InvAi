@@ -14,7 +14,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 import main
-from main import BusinessCategory, BusinessProfile, Product, ProductBatch, User, UserRole
+from main import BusinessCategory, BusinessProfile, Product, ProductBatch, StockMovement, User, UserRole
 
 BUSINESS_ID = "1111"
 OTHER_BUSINESS_ID = "2222"
@@ -86,7 +86,8 @@ def api(engine):
 @pytest.fixture
 def make_product(engine):
     """make_product(name, unit, price, [(quantity, expiry_offset_or_None, received_offset), ...]) -> (product_id, [batch_ids]).
-    Product.quantity is set to the sum of the batches, as it would be after the groundwork migration."""
+    Product.quantity is set to the sum of the batches, and each non-empty batch gets an opening ledger entry,
+    as they would after the groundwork and ledger migrations."""
     def _make(name, unit, price, batches, business_id=BUSINESS_ID):
         with Session(engine) as session:
             product = Product(name=name, sku=name, price=Decimal(price), unit=unit, business_id=business_id,
@@ -101,6 +102,8 @@ def make_product(engine):
                 session.add(batch)
                 session.flush()
                 batch_ids.append(batch.id)
+            main.record_movements(session, product, main.MovementReason.OPENING,
+                                  [(batch_id, Decimal(q)) for batch_id, (q, _, _) in zip(batch_ids, batches) if Decimal(q) != 0])
             session.commit()
             return product.id, batch_ids
     return _make
@@ -119,11 +122,40 @@ def stock(engine):
 
 
 @pytest.fixture
-def in_sync(stock):
-    """in_sync(product_id): asserts Product.quantity equals the sum of its batches and returns that quantity."""
+def movements(engine):
+    """movements(product_id=None, reason=None) -> that business-wide list of StockMovement rows, oldest first."""
+    def _movements(product_id=None, reason=None):
+        with Session(engine) as session:
+            query = select(StockMovement).order_by(StockMovement.id)
+            if product_id is not None:
+                query = query.where(StockMovement.product_id == product_id)
+            if reason is not None:
+                query = query.where(StockMovement.reason == reason)
+            return session.exec(query).all()
+    return _movements
+
+
+@pytest.fixture
+def in_sync(stock, movements):
+    """in_sync(product_id): asserts that Product.quantity equals the sum of its batches, that the ledger agrees
+    (per batch: its entries sum to its quantity; per product: they sum to Product.quantity, and the latest
+    product_quantity_after equals it), and returns Product.quantity."""
     def _check(product_id):
-        product_qty, batch_total, _ = stock(product_id)
+        product_qty, batch_total, by_batch = stock(product_id)
         assert product_qty == batch_total, f"Product.quantity {product_qty} != batch total {batch_total}"
+
+        entries = movements(product_id)
+        ledger_by_batch = {}
+        for entry in entries:
+            ledger_by_batch[entry.batch_id] = ledger_by_batch.get(entry.batch_id, Decimal("0")) + entry.quantity_change
+        for batch_id, quantity in by_batch.items():
+            assert ledger_by_batch.get(batch_id, Decimal("0")) == quantity, \
+                f"batch {batch_id}: ledger sums to {ledger_by_batch.get(batch_id, 0)}, batch holds {quantity}"
+        assert set(ledger_by_batch) <= set(by_batch), "ledger entries for batches this product doesn't have"
+        assert sum(ledger_by_batch.values(), Decimal("0")) == product_qty, "ledger doesn't sum to Product.quantity"
+        if entries:
+            assert entries[-1].product_quantity_after == product_qty, \
+                f"latest product_quantity_after {entries[-1].product_quantity_after} != Product.quantity {product_qty}"
         return product_qty
     return _check
 

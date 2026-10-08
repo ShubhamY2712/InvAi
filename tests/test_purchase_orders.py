@@ -7,7 +7,7 @@ from main import ProductBatch, PurchaseOrder, StockUnit
 from conftest import day
 
 
-def test_stocking_creates_batch_received_today(api, engine, make_product, stock):
+def test_stocking_creates_batch_received_today(api, engine, make_product, in_sync):
     product_id, _ = make_product("Rice", StockUnit.KG, "1.00", [("5", None, -9)])
     supplier_id = api("POST", "/suppliers/", {"name": "Vendor"})[1]["supplier_id"]
     po_id = api("POST", "/purchase-orders/", {"supplier_id": supplier_id, "product_id": product_id,
@@ -20,8 +20,7 @@ def test_stocking_creates_batch_received_today(api, engine, make_product, stock)
     assert batch.received_date == day(0)  # today() in Asia/Kolkata, pinned by the fixed_today fixture
     assert batch.expiry_date == day(20)
     assert batch.quantity == 10
-    product_qty, batch_total, _ = stock(product_id)
-    assert product_qty == batch_total == 15
+    assert in_sync(product_id) == 15
 
 
 def test_purchase_order_timestamp_is_naive_utc(api, engine, make_product):

@@ -11,7 +11,7 @@ def batches_for(engine, product_id):
         return session.exec(select(ProductBatch).where(ProductBatch.product_id == product_id)).all()
 
 
-def test_initial_quantity_creates_opening_batch_with_expiry(api, engine, stock):
+def test_initial_quantity_creates_opening_batch_with_expiry(api, engine, in_sync):
     status, body = api("POST", "/products/", {"name": "Milk", "sku": "M1", "price": 1.2, "quantity": 10,
                                               "expiry_date": str(day(30))})
     assert status == 200
@@ -21,8 +21,7 @@ def test_initial_quantity_creates_opening_batch_with_expiry(api, engine, stock):
     assert batch.expiry_date == day(30)
     assert batch.po_id is None
     assert batch.received_date == day(0)  # today() in Asia/Kolkata, pinned by the fixed_today fixture
-    product_qty, batch_total, _ = stock(product_id)
-    assert product_qty == batch_total == 10
+    assert in_sync(product_id) == 10
 
 
 def test_opening_batch_without_expiry_never_expires(api, engine):
