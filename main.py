@@ -13,10 +13,14 @@ from jose import jwt, JWTError
 import enum
 
 
+load_dotenv()
+
 # --- JWT CONFIGURATION ---
 # --- THE DOOR ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-SECRET_KEY = "invai_super_secret_dev_key_123!" # Never share this in production
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY is not set. Add it to your .env file.")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 # The user will stay logged in for 1 hour
 
@@ -82,7 +86,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         # If the signature fails or token is expired, kick them out
         raise credentials_exception
 
-load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
