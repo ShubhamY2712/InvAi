@@ -10,6 +10,8 @@ from enum import Enum
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
+import secrets
+from sqlalchemy.exc import IntegrityError
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
@@ -162,16 +164,31 @@ def require_role(current_user: dict, *allowed_roles: UserRole, detail: str = "Yo
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
 
 
-import random
-
 # --- ID GENERATOR LOGIC ---
+# No 0/O or 1/I, so IDs can be read out and typed without mix-ups
+BUSINESS_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+BUSINESS_ID_LENGTH = 8  # 32^8 ≈ 1.1 trillion IDs
+
 def generate_business_id() -> str:
-    """Generates a random 4-digit ID (e.g., 4092)"""
-    return str(random.randint(1000, 9999))
+    """Generates a random 8-character business ID (e.g. "K7QM2XRA") using a cryptographically secure source."""
+    return "".join(secrets.choice(BUSINESS_ID_ALPHABET) for _ in range(BUSINESS_ID_LENGTH))
+
+# Which unique rule an IntegrityError broke, matched on the Postgres constraint name or the SQLite "table.column"
+UNIQUE_VIOLATION_MARKERS = {
+    "business_id": ("businessprofile_pkey", "businessprofile.id"),
+    "username": ("ix_users_username", "users.username"),
+    "email": ("ix_users_email", "users.email"),
+}
+
+def duplicate_field(exc: IntegrityError) -> str | None:
+    """Returns "business_id", "username" or "email" if exc is a duplicate on that field, else None."""
+    message = str(exc.orig)
+    return next((field for field, markers in UNIQUE_VIOLATION_MARKERS.items()
+                 if any(marker in message for marker in markers)), None)
 
 # --- MULTI-TENANT DATABASE TABLES ---
 class BusinessProfile(SQLModel, table=True):
-    # ID is now a String, and automatically generates a 4-digit number
+    # 8-character random string ID; onboarding retries if one is ever already taken
     id: str = Field(default_factory=generate_business_id, primary_key=True)
     business_name: str
     category: BusinessCategory
@@ -183,7 +200,7 @@ class User(SQLModel, table=True):
     email: str = Field(unique=True, index=True)
     hashed_password: str
     role: UserRole = Field(default=UserRole.STAFF)
-    business_id: str = Field(foreign_key="businessprofile.id") 
+    business_id: str = Field(foreign_key="businessprofile.id", index=True)
 
 class Product(SQLModel, table=True):
     __tablename__ = "product"
@@ -207,7 +224,7 @@ class Sale(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     product_id: int = Field(index=True) # What was sold
     user_id: int = Field(index=True)    # Who sold it (Ankit or Rahul)
-    business_id: str = Field(index=True) # Multi-tenant lock
+    business_id: str = Field(foreign_key="businessprofile.id", index=True) # Multi-tenant lock
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
     total_price: Money = Field(max_digits=12, decimal_places=2)
 
@@ -221,7 +238,7 @@ class Supplier(SQLModel, table=True):
     name: str
     contact_email: str | None = None
     phone: str | None = None
-    business_id: str = Field(index=True) # Locks this supplier to FreshMart only
+    business_id: str = Field(foreign_key="businessprofile.id", index=True) # Locks this supplier to FreshMart only
 
 
 @asynccontextmanager
@@ -260,39 +277,52 @@ class ProductUpdate(SQLModel):
     description: str | None = None
     unit: StockUnit | None = None
 
+BUSINESS_ID_RETRIES = 5  # extra attempts, only when the generated business ID is already taken
+
 @app.post("/onboard-business/")
 def onboard_new_business(request: OnboardingRequest):
-    with Session(engine) as session:
-        new_business = BusinessProfile(
-            business_name=request.business_name,
-            category=request.category
-        )
-        session.add(new_business)
-        session.flush() # Saves the business temporarily so we can grab the new 4-digit ID
-        
-        # Assemble Owner ID: "BusinessID" + "001" (e.g., 4092001)
-        owner_id = f"{new_business.id}001"
-        
-        # Create the Owner Profile with a mathematically secured password
-        new_user = User(
-            id=owner_id,
-            username=request.owner_username, # Fixed: Uses the username from the JSON
-            email=request.email,
-            hashed_password=get_password_hash(request.password), # Fixed: Hashes the actual password!
-            role="Owner",
-            business_id=new_business.id
-        )
-        
-        session.add(new_user)
-        session.commit()
-        session.refresh(new_business)
-        session.refresh(new_user)
-        
-        return {
-            "success": True,
-            "business_id": new_business.id,
-            "owner_user_id": new_user.id
-        }
+    hashed_password = get_password_hash(request.password)  # hashed once, not on every retry
+
+    for _ in range(1 + BUSINESS_ID_RETRIES):
+        with Session(engine) as session:
+            new_business = BusinessProfile(
+                id=generate_business_id(),
+                business_name=request.business_name,
+                category=request.category
+            )
+            # Create the Owner Profile; like every user, its id comes from the database sequence
+            new_user = User(
+                username=request.owner_username,
+                email=request.email,
+                hashed_password=hashed_password,
+                role="Owner",
+                business_id=new_business.id
+            )
+            session.add(new_business)
+            session.add(new_user)
+
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                duplicate = duplicate_field(exc)
+                if duplicate == "business_id":
+                    continue  # pick a new ID and try again
+                if duplicate == "username":
+                    raise HTTPException(status_code=409, detail=f"Username '{request.owner_username}' is already taken.")
+                if duplicate == "email":
+                    raise HTTPException(status_code=409, detail=f"Email '{request.email}' is already registered.")
+                raise
+
+            session.refresh(new_business)
+            session.refresh(new_user)
+            return {
+                "success": True,
+                "business_id": new_business.id,
+                "owner_user_id": new_user.id
+            }
+
+    raise HTTPException(status_code=503, detail="Couldn't allocate a unique business ID. Please try again.")
     
 @app.post("/login/")
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -619,13 +649,12 @@ def process_checkout(
                 detail=f"User ID {clean_user_id} not found."
             )
 
-        # 2. Find and lock the product (Also stripping the business_id just to be safe!)
+        # 2. Find and lock the product
         # Lock order is always product first, then its batches, so concurrent checkouts can't deadlock
-        clean_business_id = str(current_user["business_id"]).strip()
 
         statement = select(Product).where(
             Product.id == request.product_id,
-            Product.business_id == clean_business_id
+            Product.business_id == current_user["business_id"]
         ).with_for_update()
         product = session.exec(statement).first()
 
@@ -644,7 +673,7 @@ def process_checkout(
         batches = lock_batches_fifo(
             session,
             ProductBatch.product_id == product.id,
-            ProductBatch.business_id == clean_business_id,
+            ProductBatch.business_id == current_user["business_id"],
             ProductBatch.quantity > 0
         )
 
@@ -669,7 +698,7 @@ def process_checkout(
         new_sale = Sale(
             product_id=product.id,
             user_id=user.id,
-            business_id=clean_business_id,
+            business_id=current_user["business_id"],
             quantity=request.quantity,
             total_price=round_money(product.price * request.quantity)
         )
@@ -690,7 +719,7 @@ def process_checkout(
                 sale_id=new_sale.id,
                 batch_id=batch.id,
                 quantity=taken,
-                business_id=clean_business_id
+                business_id=current_user["business_id"]
             ))
             allocations.append({"batch_id": batch.id, "quantity": taken, "expiry_date": batch.expiry_date})
 
@@ -715,17 +744,16 @@ def process_checkout(
 def get_sales_history(current_user: dict = Depends(get_current_user)):
     with Session(engine) as session:
         # Clean the token data just like we did in checkout
-        clean_business_id = str(current_user["business_id"]).strip()
         clean_user_id = int(str(current_user["user_id"]).strip())
         
         # The Logic Split: Owner vs Staff
         if has_role(current_user, UserRole.OWNER, UserRole.MANAGER):
             # The Boss sees EVERYTHING for this specific business
-            statement = select(Sale).where(Sale.business_id == clean_business_id)
+            statement = select(Sale).where(Sale.business_id == current_user["business_id"])
         else:
             # The Staff only sees the sales attached to their specific user_id
             statement = select(Sale).where(
-                Sale.business_id == clean_business_id,
+                Sale.business_id == current_user["business_id"],
                 Sale.user_id == clean_user_id
             )
         
@@ -755,15 +783,13 @@ def add_supplier(
     current_user: dict = Depends(get_current_user)
 ):
     with Session(engine) as session:
-        # Clean the business ID from the token for safety
-        clean_business_id = str(current_user["business_id"]).strip()
 
         # Create the new supplier in the database
         new_supplier = Supplier(
             name=supplier.name,
             contact_email=supplier.contact_email,
             phone=supplier.phone,
-            business_id=clean_business_id
+            business_id=current_user["business_id"]
         )
 
         session.add(new_supplier)
@@ -789,7 +815,7 @@ class PurchaseOrder(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     supplier_id: int = Field(index=True)
     product_id: int = Field(index=True)
-    business_id: str = Field(index=True)
+    business_id: str = Field(foreign_key="businessprofile.id", index=True)
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
     unit_cost: Money = Field(max_digits=12, decimal_places=2)
     total_cost: Money = Field(max_digits=12, decimal_places=2)
@@ -806,13 +832,12 @@ def process_purchase_order(
     current_user: dict = Depends(get_current_user)
 ):
     with Session(engine) as session:
-        clean_business_id = str(current_user["business_id"]).strip()
 
         # 1. Verify the Supplier belongs to this business
         supplier = session.exec(
             select(Supplier).where(
                 Supplier.id == request.supplier_id, 
-                Supplier.business_id == clean_business_id
+                Supplier.business_id == current_user["business_id"]
             )
         ).first()
         if not supplier:
@@ -822,7 +847,7 @@ def process_purchase_order(
         product = session.exec(
             select(Product).where(
                 Product.id == request.product_id, 
-                Product.business_id == clean_business_id
+                Product.business_id == current_user["business_id"]
             )
         ).first()
         if not product:
@@ -834,7 +859,7 @@ def process_purchase_order(
         new_po = PurchaseOrder(
             supplier_id=supplier.id,
             product_id=product.id,
-            business_id=clean_business_id,
+            business_id=current_user["business_id"],
             quantity=request.quantity,
             unit_cost=request.unit_cost,          
             total_cost=calculated_total_cost,
@@ -863,8 +888,7 @@ def mark_po_delivered(
     current_user: dict = Depends(get_current_user)
 ):
     with Session(engine) as session:
-        clean_business_id = str(current_user["business_id"]).strip()
-        po = session.exec(select(PurchaseOrder).where(PurchaseOrder.id == po_id, PurchaseOrder.business_id == clean_business_id)).first()
+        po = session.exec(select(PurchaseOrder).where(PurchaseOrder.id == po_id, PurchaseOrder.business_id == current_user["business_id"])).first()
         
         if not po:
             raise HTTPException(status_code=404, detail="Purchase Order not found.")
@@ -954,13 +978,12 @@ def manual_stock_adjustment(
     require_future_expiry(expiry_date)
 
     with Session(engine) as session:
-        clean_business_id = str(current_user["business_id"]).strip()
 
         # 1. Lock the product, then its batches (same order as checkout)
         product = session.exec(
             select(Product).where(
                 Product.id == product_id,
-                Product.business_id == clean_business_id
+                Product.business_id == current_user["business_id"]
             ).with_for_update()
         ).first()
 
@@ -976,7 +999,7 @@ def manual_stock_adjustment(
         batches = lock_batches_fifo(
             session,
             ProductBatch.product_id == product.id,
-            ProductBatch.business_id == clean_business_id,
+            ProductBatch.business_id == current_user["business_id"],
             ProductBatch.quantity > 0
         )
 
@@ -1008,7 +1031,7 @@ def manual_stock_adjustment(
             adjustment = ProductBatch(
                 product_id=product.id,
                 po_id=None,
-                business_id=clean_business_id,
+                business_id=current_user["business_id"],
                 quantity=new_quantity - batch_total,
                 received_date=today(),
                 expiry_date=expiry_date
@@ -1041,7 +1064,7 @@ class ProductBatch(SQLModel, table=True):
     product_id: int = Field(foreign_key="product.id", index=True)
     po_id: int | None = Field(default=None, foreign_key="purchase_order.id")
     
-    business_id: str = Field(index=True)
+    business_id: str = Field(foreign_key="businessprofile.id", index=True)
     quantity: Quantity = Field(default=Decimal("0"), max_digits=12, decimal_places=3)
     received_date: date
     expiry_date: date | None = None  # NULL = never expires (e.g. opening stock)
@@ -1053,7 +1076,7 @@ class SaleBatchAllocation(SQLModel, table=True):
     sale_id: int = Field(foreign_key="sales.id", index=True)
     batch_id: int = Field(foreign_key="product_batch.id", index=True)
     quantity: Quantity = Field(max_digits=12, decimal_places=3)
-    business_id: str = Field(index=True)
+    business_id: str = Field(foreign_key="businessprofile.id", index=True)
 
 
 @app.get("/products/{product_id}/batches")
