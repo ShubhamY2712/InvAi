@@ -1,12 +1,14 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from typing import List
+from typing import Annotated, List
+from pydantic import PlainSerializer
 import os
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from enum import Enum
 from datetime import date, timedelta
+from decimal import Decimal
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
@@ -100,6 +102,21 @@ class BusinessCategory(str, Enum):
     INDUSTRIAL = "Industrial & Hardware"
     SERVICES = "Service-Based Inventory"
 
+class StockUnit(str, Enum):
+    PIECE = "piece"
+    KG = "kg"
+    G = "g"
+    LITRE = "litre"
+    ML = "ml"
+
+# Stock quantities stay Decimal in Python but go out as JSON numbers (Pydantic would otherwise emit strings)
+Quantity = Annotated[Decimal, PlainSerializer(float, return_type=float, when_used="json")]
+
+def format_qty(quantity, unit: StockUnit | None = None) -> str:
+    """Formats a quantity for messages: no trailing zeros, plus the unit (e.g. "1.5 kg")."""
+    text = format(Decimal(str(quantity)).normalize(), "f")
+    return f"{text} {unit.value}" if unit else text
+
 class UserRole(str, enum.Enum):
     OWNER = "Owner"
     STAFF = "Staff"
@@ -147,12 +164,13 @@ class Product(SQLModel, table=True):
     sku: str = Field(index=True) # Stock Keeping Unit (Barcode equivalent)
     description: str | None = None
     price: float
-    quantity: int = Field(default=0)
-    
+    quantity: Quantity = Field(default=Decimal("0"), max_digits=12, decimal_places=3)
+    unit: StockUnit = Field(default=StockUnit.PIECE)
+
     # The crucial multi-tenant lock: This ties the product to a specific business
     business_id: str = Field(foreign_key="businessprofile.id", index=True)
 
-    min_stock_level: int = Field(default=10)
+    min_stock_level: Quantity = Field(default=Decimal("10"), max_digits=12, decimal_places=3)
 
 
 class Sale(SQLModel, table=True):
@@ -162,7 +180,7 @@ class Sale(SQLModel, table=True):
     product_id: int = Field(index=True) # What was sold
     user_id: int = Field(index=True)    # Who sold it (Ankit or Rahul)
     business_id: str = Field(index=True) # Multi-tenant lock
-    quantity: int
+    quantity: Quantity = Field(max_digits=12, decimal_places=3)
     total_price: float
     
     # Automatically stamps the exact millisecond the sale happens
@@ -547,7 +565,7 @@ def process_checkout(
         if product.quantity < request.quantity:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Not enough stock! Only {product.quantity} units of {product.name} left."
+                detail=f"Not enough stock! Only {format_qty(product.quantity, product.unit)} of {product.name} left."
             )
 
         # 5. Calculate Revenue
@@ -575,7 +593,7 @@ def process_checkout(
 
         return {
             "success": True,
-            "message": f"Successfully sold {request.quantity}x {product.name}",
+            "message": f"Successfully sold {format_qty(request.quantity, product.unit)} of {product.name}",
             "revenue": total_price,
             "stock_remaining": product.quantity,
             "sale_id": new_sale.id
@@ -660,8 +678,8 @@ class PurchaseOrder(SQLModel, table=True):
     supplier_id: int = Field(index=True)
     product_id: int = Field(index=True)
     business_id: str = Field(index=True)
-    quantity: int
-    unit_cost: float                     
+    quantity: Quantity = Field(max_digits=12, decimal_places=3)
+    unit_cost: float
     total_cost: float                    
     status: str = Field(default="PENDING") 
     
@@ -720,7 +738,7 @@ def process_purchase_order(
 
         return {
             "success": True,
-            "message": f"Order placed for {request.quantity}x {product.name}. Awaiting delivery.",
+            "message": f"Order placed for {format_qty(request.quantity, product.unit)} of {product.name}. Awaiting delivery.",
             "current_stock_level": product.quantity,  # Unchanged!
             "expense": calculated_total_cost,
             "po_id": new_po.id,
@@ -794,7 +812,7 @@ def stock_purchase_order(po_id: int, expiry_date: date, current_user: dict = Dep
         session.commit()
         
         return {
-            "message": f"PO Stocked. {po.quantity} items added to main inventory.",
+            "message": f"PO Stocked. {format_qty(po.quantity, product.unit if product else None)} added to main inventory.",
             "batch_expiry": new_batch.expiry_date
         }
     
@@ -846,9 +864,18 @@ class ProductBatch(SQLModel, table=True):
     po_id: int | None = Field(default=None, foreign_key="purchase_order.id")
     
     business_id: str = Field(index=True)
-    quantity: int = Field(default=0)
+    quantity: Quantity = Field(default=Decimal("0"), max_digits=12, decimal_places=3)
     received_date: date
-    expiry_date: date
+    expiry_date: date | None = None  # NULL = never expires (e.g. opening stock)
+
+
+class SaleBatchAllocation(SQLModel, table=True):
+    __tablename__ = "sale_batch_allocation"
+    id: int | None = Field(default=None, primary_key=True)
+    sale_id: int = Field(foreign_key="sales.id", index=True)
+    batch_id: int = Field(foreign_key="product_batch.id", index=True)
+    quantity: Quantity = Field(max_digits=12, decimal_places=3)
+    business_id: str = Field(index=True)
 
 
 @app.get("/products/{product_id}/batches")
