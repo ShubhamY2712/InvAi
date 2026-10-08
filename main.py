@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Header, status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
-from sqlmodel import Field, Session, SQLModel, create_engine, select, text
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 from typing import Optional, List
 import os
 from dotenv import load_dotenv
@@ -185,37 +185,11 @@ class Supplier(SQLModel, table=True):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ONLY UNCOMMENT THIS TO BUILD THE NEW TABLES:
-  #  SQLModel.metadata.create_all(engine)
+    SQLModel.metadata.create_all(engine)
  #   print("✅ SUPPLIER & PO TABLES SYNCED ✅")
     yield
     
 app = FastAPI(lifespan=lifespan)
-
-@app.get("/reset-po-table")
-def reset_po_table():
-    # This drops ONLY the purchase order table and rebuilds it with the new columns
-    PurchaseOrder.__table__.drop(engine)
-    PurchaseOrder.__table__.create(engine)
-    return {"message": "✅ Purchase Order table upgraded and synced!"}
-
-
-@app.get("/create-batch-table")
-def create_batch_table():
-    # This safely creates ANY missing tables without breaking foreign keys
-    SQLModel.metadata.create_all(engine)
-    return {"message": "All missing tables (including ProductBatch) created successfully!"}
-
-@app.get("/upgrade-product-table")
-def upgrade_product_table():
-    with Session(engine) as session:
-        try:
-            # We use raw SQL to physically alter the existing table
-            session.exec(text("ALTER TABLE product ADD COLUMN min_stock_level INTEGER DEFAULT 10;"))
-            session.commit()
-            return {"message": "Success! min_stock_level column added to the database."}
-        except Exception as e:
-            return {"error": f"Column might already exist, or another error occurred: {str(e)}"}
-
 
 
 # --- 4. FEATURE 1: DYNAMIC ONBOARDING ---
