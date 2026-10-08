@@ -16,6 +16,10 @@ from sqlalchemy import Date, Index, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.expression import FunctionElement
+from alembic.config import Config as AlembicConfig
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from pathlib import Path
 import bcrypt
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
@@ -195,6 +199,16 @@ def duplicate_field(exc: IntegrityError) -> str | None:
     return next((field for field, markers in UNIQUE_VIOLATION_MARKERS.items()
                  if any(marker in message for marker in markers)), None)
 
+# Explicit constraint names, identical to Postgres's own defaults, so Alembic migrations can refer to them
+# (an unnamed constraint can't be dropped or altered by a migration). Must be set before the models below.
+SQLModel.metadata.naming_convention = {
+    "ix": "ix_%(column_0_label)s",
+    "uq": "%(table_name)s_%(column_0_name)s_key",
+    "ck": "%(table_name)s_%(constraint_name)s_check",
+    "fk": "%(table_name)s_%(column_0_name)s_fkey",
+    "pk": "%(table_name)s_pkey",
+}
+
 # --- MULTI-TENANT DATABASE TABLES ---
 class BusinessProfile(SQLModel, table=True):
     # 8-character random string ID; onboarding retries if one is ever already taken
@@ -255,11 +269,22 @@ class Supplier(SQLModel, table=True):
     business_id: str = Field(foreign_key="businessprofile.id", index=True) # Locks this supplier to FreshMart only
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+SCHEMA_OUT_OF_DATE = "Database schema is out of date. Run: alembic upgrade head"
+
+def check_schema_is_current(db_engine) -> None:
+    """Raises RuntimeError unless the database is at the Alembic head revision(s) of this code."""
+    heads = set(ScriptDirectory.from_config(AlembicConfig(str(PROJECT_ROOT / "alembic.ini"))).get_heads())
+    with db_engine.connect() as connection:
+        current = set(MigrationContext.configure(connection).get_current_heads())
+    if current != heads:
+        raise RuntimeError(f"{SCHEMA_OUT_OF_DATE} "
+                           f"(database: {', '.join(sorted(current)) or 'none'}; code: {', '.join(sorted(heads))})")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ONLY UNCOMMENT THIS TO BUILD THE NEW TABLES:
-    SQLModel.metadata.create_all(engine)
- #   print("✅ SUPPLIER & PO TABLES SYNCED ✅")
+    # The schema is managed by Alembic (docs/DATABASE.md); never run against a database that isn't up to date
+    check_schema_is_current(engine)
     yield
     
 app = FastAPI(lifespan=lifespan)

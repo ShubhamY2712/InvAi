@@ -1,6 +1,7 @@
-"""Dev only: drop every table in the database and recreate them from the models in main.py.
+"""Dev only: drop everything in the database, then run the Alembic migrations to head.
 
-Refuses to run unless DATABASE_URL points at localhost or 127.0.0.1.
+Refuses to run unless DATABASE_URL points at localhost or 127.0.0.1. The drop and the migrations run in one
+transaction, so if anything fails the database is left exactly as it was.
 
 Usage (from the project root):  python scripts/reset_db.py
 """
@@ -27,19 +28,20 @@ def reset() -> None:
     if url.host not in ALLOWED_HOSTS or {"host", "hostaddr"} & set(url.query):
         sys.exit(f"Refusing to run: DATABASE_URL host is {url.host!r}; only localhost or 127.0.0.1 is allowed.")
 
-    # Importing main registers every model on SQLModel.metadata
     sys.path.insert(0, str(PROJECT_ROOT))
-    from sqlmodel import SQLModel
-    import main  # noqa: F401
+    from alembic import command
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
 
+    config = Config(str(PROJECT_ROOT / "alembic.ini"))
     engine = create_engine(url)
     with engine.begin() as conn:  # one transaction: any failure leaves the database as it was
-        # Drop every table that exists, including ones no longer in the models
+        # Drop every table that exists, including ones no longer in the models (and alembic_version)
         existing = MetaData()
         existing.reflect(conn)
         existing.drop_all(conn)
 
-        # Postgres enum types outlive their tables; drop them so they are rebuilt from the models
+        # Postgres enum types outlive their tables; drop them so the migrations can create them again
         if conn.dialect.name == "postgresql":
             enum_types = conn.execute(text(
                 "SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace "
@@ -48,10 +50,13 @@ def reset() -> None:
             for name in enum_types:
                 conn.execute(text(f'DROP TYPE "{name}"'))
 
-        SQLModel.metadata.create_all(conn)
+        # Rebuild through the migrations, inside this same transaction (migrations/env.py uses this connection)
+        config.attributes["connection"] = conn
+        command.upgrade(config, "head")
+    engine.dispose()
 
-    print(f"Reset {url.host}/{url.database}: dropped {len(existing.tables)} tables, "
-          f"created {len(SQLModel.metadata.tables)} from the models.")
+    head = ScriptDirectory.from_config(config).get_current_head()
+    print(f"Reset {url.host}/{url.database}: dropped {len(existing.tables)} tables, migrated to head ({head}).")
 
 
 if __name__ == "__main__":
