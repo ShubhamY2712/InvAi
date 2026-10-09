@@ -14,9 +14,24 @@ from app.models import UserRole
 # --- JWT CONFIGURATION ---
 # --- THE DOOR ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-SECRET_KEY = secret_key()
-if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY is not set. Add it to your .env file.")
+
+SECRET_KEY_PLACEHOLDER = "replace-with-a-long-random-string"  # the value in .env.example
+SECRET_KEY_MIN_LENGTH = 32
+_GENERATE_KEY = 'python -c "import secrets; print(secrets.token_urlsafe(48))"'
+
+
+def validate_secret_key(value: str | None) -> str:
+    """Returns the key, or raises RuntimeError if it's missing, the .env.example placeholder, or too short."""
+    if not value:
+        raise RuntimeError("SECRET_KEY is not set. Add it to your .env file.")
+    if value == SECRET_KEY_PLACEHOLDER:
+        raise RuntimeError(f"SECRET_KEY is still the .env.example placeholder. Generate one with: {_GENERATE_KEY}")
+    if len(value) < SECRET_KEY_MIN_LENGTH:
+        raise RuntimeError(f"SECRET_KEY must be at least {SECRET_KEY_MIN_LENGTH} characters. Generate one with: {_GENERATE_KEY}")
+    return value
+
+
+SECRET_KEY = validate_secret_key(secret_key())
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 # The user will stay logged in for 1 hour
 
@@ -98,6 +113,18 @@ def require_role(current_user: dict, *allowed_roles: UserRole, detail: str = "Yo
     """Raises 403 unless the token's role matches one of allowed_roles (case-insensitive)."""
     if not has_role(current_user, *allowed_roles):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+def require_user_id(current_user: dict) -> int:
+    """The token's user id as an int; a token whose subject isn't a user id gets the same 401 as a bad token."""
+    user_id = acting_user_id(current_user)
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user_id
 
 
 def acting_user_id(current_user: dict) -> int | None:

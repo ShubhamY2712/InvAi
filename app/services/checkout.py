@@ -21,7 +21,7 @@ def checkout(request: CheckoutRequest, business_id: str, user_id: int) -> dict:
         user = session.get(User, user_id)
 
         if not user:
-            raise Unauthorized(f"User ID {user_id} not found.")
+            raise Unauthorized("User not found.")
 
         # 2. Find and lock the product
         # Lock order is always product first, then its batches, so concurrent checkouts can't deadlock
@@ -125,18 +125,16 @@ def sales_history(business_id: str, user_id: int, own_sales_only: bool) -> dict:
         sales = session.exec(select(Sale).where(*conditions)).all()
 
         # Quantities sold per unit: kg and pieces are never added together.
-        # Left join, so a sale whose product no longer exists is reported as "unknown" rather than dropped.
+        # Every sale has a product (sales_product_id_fkey), so an inner join loses nothing.
         per_unit = session.exec(
             select(Product.unit, func.sum(Sale.quantity))
             .select_from(Sale)
-            .outerjoin(Product, Product.id == Sale.product_id)
+            .join(Product, Product.id == Sale.product_id)
             .where(*conditions)
             .group_by(Product.unit)
         ).all()
         sold = {unit: Decimal(str(quantity)).quantize(Decimal("0.001")) for unit, quantity in per_unit}
         items_sold_by_unit = {unit.value: sold[unit] for unit in StockUnit if unit in sold}
-        if None in sold:
-            items_sold_by_unit["unknown"] = sold[None]
 
         # Calculate quick analytics for the response
         total_revenue = sum(sale.total_price for sale in sales)

@@ -103,7 +103,7 @@ def test_star_is_rejected(app_with, value):
 
 
 def test_star_stops_uvicorn_from_starting():
-    env = {**os.environ, "CORS_ORIGINS": "https://app.example.com,*", "DATABASE_URL": "sqlite://", "SECRET_KEY": "test-secret"}
+    env = {**os.environ, "CORS_ORIGINS": "https://app.example.com,*", "DATABASE_URL": "sqlite://", "SECRET_KEY": "test-only-secret-key-at-least-32-chars"}
     result = subprocess.run([sys.executable, "-m", "uvicorn", "app.main:app", "--port", "0"], cwd=ROOT, env=env,
                             capture_output=True, text=True, timeout=120)
     assert result.returncode != 0

@@ -18,6 +18,7 @@ def add_supplier(
     supplier: SupplierCreate,
     current_user: dict = Depends(get_current_user)
 ):
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Only the Owner or a Manager can add suppliers.")
     return suppliers.add_supplier(supplier, current_user["business_id"])
 
 

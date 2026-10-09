@@ -1,4 +1,4 @@
-"""Accounts and identity: onboarding, login, employees, and who am I."""
+"""Accounts: onboarding, login and employees."""
 from fastapi import APIRouter, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 
@@ -29,12 +29,3 @@ def add_employee(
     require_role(current_user, UserRole.OWNER, detail="Only business owners can add employees.")
     return accounts.add_employee(employee_data, current_user["business_id"])
 
-
-@router.get("/dev/me/")
-def get_my_profile(current_user: dict = Depends(get_current_user)):
-    """A protected route. You can only see this if the Bouncer lets you in."""
-    return {
-        "success": True,
-        "message": "You made it past the bouncer!",
-        "your_secure_data": current_user
-    }

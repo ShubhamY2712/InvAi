@@ -2,6 +2,17 @@
 
 > An enterprise-grade Agentic AI SaaS moving beyond conversational interfaces to execute autonomous, data-driven supply chain orchestration.
 
+**InvAi is an inventory and supply-chain platform for shops, with many businesses served from one deployment.**
+This repository holds its backend: a FastAPI + PostgreSQL API for products in expiry-dated batches, stock sold soonest-expiry-first, an append-only stock ledger, purchase orders, supplier scorecards and sales reports.
+
+## 🚀 Getting started
+
+**Prerequisites:** Python 3.10+ and PostgreSQL 17+.
+
+* [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): set up Postgres, run the API locally, take a first walkthrough, run the tests, schedule the daily expiry check.
+* [docs/DATABASE.md](docs/DATABASE.md): how the schema changes (Alembic migrations) and the gotchas to watch for.
+* [ARCHITECTURE.md](ARCHITECTURE.md) describes what is built and what is planned. The AI features below are the roadmap, not yet in this repository; [TODO.md](TODO.md) lists the known gaps.
+
 InvAi is a multi-tenant web platform designed to democratize advanced supply chain analytics. It bridges the gap between sophisticated ML demand sensing and Generative AI, utilizing a custom-trained LLM Co-Pilot and autonomous AI agents to manage inventory, forecast stockouts, and trigger vendor reordering workflows.
 
 ## 🏗️ Core Architecture & Capabilities

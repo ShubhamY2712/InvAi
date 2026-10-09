@@ -7,15 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from conftest import local_postgres_url
+from conftest import postgres_test_server
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_migrations_at_head_match_the_models():
-    url = local_postgres_url()
+    url, skip_reason = postgres_test_server()
     if url is None:
-        pytest.skip("no local Postgres server in .env")
+        pytest.skip(skip_reason)
     env = {**os.environ, "DATABASE_URL": url}
     env.pop("SECRET_KEY", None)  # use the real one from .env
     result = subprocess.run([sys.executable, "scripts/check_migrations.py"], cwd=ROOT, env=env,

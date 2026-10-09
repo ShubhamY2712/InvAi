@@ -121,6 +121,7 @@ class User(SQLModel, table=True):
     username: str = Field(unique=True, index=True)
     email: str = Field(unique=True, index=True)
     hashed_password: str
+    full_name: str | None = Field(default=None, max_length=100)  # set for employees; owners and older users have none
     role: UserRole = Field(default=UserRole.STAFF)
     business_id: str = Field(foreign_key="businessprofile.id", index=True)
 

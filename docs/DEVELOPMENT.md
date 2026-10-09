@@ -21,8 +21,9 @@ Every setting the app reads is listed, with a placeholder and a comment, in the 
 | Setting | Used for |
 |---|---|
 | `DATABASE_URL` | Postgres connection for the app, Alembic and the scripts |
-| `SECRET_KEY` | Signs login tokens; the app won't start without it |
+| `SECRET_KEY` | Signs login tokens. The app won't start if it's missing, shorter than 32 characters, or still the `.env.example` placeholder |
 | `CORS_ORIGINS` | Browser origins allowed to call the API (see below) |
+| `DOCS_ENABLED` | `true` (default) serves `/docs`, `/redoc` and `/openapi.json`; `false` turns all three off. Set it to `false` in production. Values: `true/false`, `1/0`, `yes/no` |
 
 ## CORS
 
@@ -67,6 +68,9 @@ Remember to add the frontend's production origin to `CORS_ORIGINS` when deployin
 
 ## Tests
 
-`python -m pytest`. Most tests use an in-memory SQLite database built from the models. Tests that need Postgres
-(`test_migrations.py`, `test_postgres_integrity.py`) create and drop scratch databases on the local server named in
-`.env`, and are skipped when there isn't one.
+`python -m pytest`. Most tests use an in-memory SQLite database built from the models.
+
+The Postgres tests (`test_migrations.py`, `test_postgres_integrity.py`) create and drop scratch databases on the server
+in `.env`'s `DATABASE_URL`, or in `TEST_DATABASE_URL` if you set that environment variable (useful for CI). They skip,
+with the reason, when that server isn't on `localhost`, can't be reached, or its user can't create databases. To let
+them run, give the user that permission: `ALTER ROLE <user> CREATEDB;`

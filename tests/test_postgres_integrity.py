@@ -9,20 +9,23 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from app import db, models, security
-from conftest import asgi_request, day, local_postgres_url
+from conftest import asgi_request, day, postgres_test_server
 
 ROOT = Path(__file__).resolve().parent.parent
-PREVIOUS, HEAD = "7086dfa92b45", "20ef20ef2e0a"
+PREVIOUS = "7086dfa92b45"  # the revision just before the integrity migration (20ef20ef2e0a)
+HEAD = ScriptDirectory.from_config(AlembicConfig(str(ROOT / "alembic.ini"))).get_current_head()
 NEW_FKS = {"sales_product_id_fkey", "sales_user_id_fkey", "purchase_order_supplier_id_fkey", "purchase_order_product_id_fkey"}
 TRIGGERS = {"stock_movement_no_update_or_delete", "stock_movement_no_truncate"}
 
-SERVER = local_postgres_url()
-pytestmark = pytest.mark.skipif(SERVER is None, reason="no local Postgres server in .env")
+SERVER, SKIP_REASON = postgres_test_server()
+pytestmark = pytest.mark.skipif(SERVER is None, reason=SKIP_REASON or "")
 
 
 def run(args, url):
@@ -154,7 +157,7 @@ def test_upgrade_aborts_cleanly_when_rows_point_at_nothing():
 def test_downgrade_then_upgrade():
     with scratch_database() as (url, engine):
         seed(engine)
-        alembic(url, "downgrade", "-1")
+        alembic(url, "downgrade", PREVIOUS)  # undo the integrity migration (and anything after it)
         version, fks, triggers, functions = catalog(engine)
         assert version == PREVIOUS and not (NEW_FKS & fks) and not triggers and functions == 0
         with engine.begin() as conn:  # no triggers now: the ledger can be changed again

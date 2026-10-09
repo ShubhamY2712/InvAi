@@ -3,9 +3,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from app import db, models
-from app.errors import BadRequest, Conflict, Unauthorized, Unavailable
+from app.errors import Conflict, Unauthorized, Unavailable
 from app.models import BusinessProfile, User
-from app.schemas import EmployeeCreate, OnboardingRequest
+from app.schemas import PASSWORD_MAX_BYTES, EmployeeCreate, OnboardingRequest
 from app.security import create_access_token, get_password_hash, verify_password
 
 BUSINESS_ID_RETRIES = 5  # extra attempts, only when the generated business ID is already taken
@@ -59,6 +59,10 @@ def onboard_business(request: OnboardingRequest) -> dict:
 
 def login(username: str, password: str) -> dict:
     """Checks the credentials and returns a bearer token."""
+    # No stored password can be longer (bcrypt would raise rather than compare), so it can't match
+    if len(password.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        raise Unauthorized("Incorrect username or password")
+
     with db.new_session() as session:
         # 1. Search the database for the username the user typed in
         statement = select(User).where(User.username == username)
@@ -92,18 +96,16 @@ def login(username: str, password: str) -> dict:
 
 
 def add_employee(employee_data: EmployeeCreate, business_id: str) -> dict:
+    """Adds a user to the business. A taken username or email is a 409, decided by the database's unique
+    indexes (so two simultaneous requests can't both succeed)."""
+    # 1. Hash the employee's password before saving
+    hashed_pw = get_password_hash(employee_data.password)
+
     with db.new_session() as session:
-        # 1. Check if the username is already taken
-        existing_user = session.exec(select(User).where(User.username == employee_data.username)).first()
-        if existing_user:
-            raise BadRequest("Username already exists.")
-
-        # 2. Hash the employee's password before saving
-        hashed_pw = get_password_hash(employee_data.password)
-
-        # 3. Create the new User record linked to the Owner's business_id
+        # 2. Create the new User record linked to the Owner's business_id
         new_employee = User(
             username=employee_data.username,
+            full_name=employee_data.full_name,
             hashed_password=hashed_pw,
             email=employee_data.email,
             role=employee_data.role,
@@ -111,7 +113,16 @@ def add_employee(employee_data: EmployeeCreate, business_id: str) -> dict:
         )
 
         session.add(new_employee)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            duplicate = db.duplicate_field(exc)
+            if duplicate == "username":
+                raise Conflict(f"Username '{employee_data.username}' is already taken.")
+            if duplicate == "email":
+                raise Conflict(f"Email '{employee_data.email}' is already registered.")
+            raise
         session.refresh(new_employee)
 
         return {

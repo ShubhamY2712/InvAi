@@ -17,6 +17,19 @@ def secret_key() -> str | None:
     return os.getenv("SECRET_KEY")
 
 
+_TRUE, _FALSE = {"true", "1", "yes"}, {"false", "0", "no"}
+
+
+def docs_enabled() -> bool:
+    """DOCS_ENABLED: serve /docs, /redoc and /openapi.json. Unset means true; anything unrecognised stops startup."""
+    raw = os.getenv("DOCS_ENABLED", "true").strip().lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    raise RuntimeError(f'DOCS_ENABLED must be true or false (also accepted: 1/0, yes/no), not "{raw}".')
+
+
 def cors_origins() -> list[str]:
     """Origins allowed to call the API from a browser, from CORS_ORIGINS (comma-separated).
     Empty or unset allows no cross-origin requests. A "*" anywhere is refused: list origins explicitly."""

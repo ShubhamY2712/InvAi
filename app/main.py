@@ -41,8 +41,15 @@ async def service_error_response(request: Request, exc: ServiceError) -> JSONRes
 
 
 def create_app() -> FastAPI:
-    """Builds the app. CORS_ORIGINS is read here, so a "*" in it stops the app before it starts."""
-    application = FastAPI(lifespan=lifespan)
+    """Builds the app. Settings are read here, so a bad CORS_ORIGINS or DOCS_ENABLED stops the app before it starts."""
+    docs = config.docs_enabled()
+    application = FastAPI(
+        lifespan=lifespan,
+        # DOCS_ENABLED=false removes all three (and Swagger's OAuth redirect page with them)
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
+    )
     application.add_middleware(
         StrictCORSMiddleware,
         allow_origins=config.cors_origins(),

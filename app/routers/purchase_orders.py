@@ -17,6 +17,8 @@ def process_purchase_order(
     request: PurchaseOrderCreate,
     current_user: dict = Depends(get_current_user)
 ):
+    # Placing an order commits money; receiving goods (deliver) stays open to Staff
+    require_role(current_user, UserRole.OWNER, UserRole.MANAGER, detail="Only the Owner or a Manager can place purchase orders.")
     return purchase_orders.create_purchase_order(request, current_user["business_id"])
 
 

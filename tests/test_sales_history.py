@@ -52,9 +52,3 @@ def test_other_businesses_are_excluded(api, engine, make_product):
     add_sale(engine, theirs, "9", business_id=OTHER_BUSINESS_ID)
     assert api("GET", "/sales/")[1]["items_sold_by_unit"] == {}
 
-
-def test_sales_of_missing_products_are_reported_separately(api, engine, make_product):
-    rice, _ = make_product("Rice", StockUnit.KG, "2.00", [])
-    add_sale(engine, rice, "2")
-    add_sale(engine, 99999, "4")  # product hard-deleted before deactivation existed
-    assert api("GET", "/sales/")[1]["items_sold_by_unit"] == {"kg": 2, "unknown": 4}

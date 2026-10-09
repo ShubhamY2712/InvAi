@@ -1,5 +1,6 @@
 """Shared fixtures. Every test gets a fresh in-memory SQLite database; no test can reach a real database."""
 import asyncio
+import functools
 import json
 import os
 from datetime import date, timedelta
@@ -7,7 +8,7 @@ from decimal import Decimal
 
 # main reads these at import time, and its load_dotenv() never overrides variables that are already set
 os.environ["DATABASE_URL"] = "sqlite://"
-os.environ["SECRET_KEY"] = "test-secret"
+os.environ["SECRET_KEY"] = "test-only-secret-key-at-least-32-chars"  # the app refuses keys under 32 characters
 os.environ["CORS_ORIGINS"] = ""  # tests that need CORS build their own app (tests/test_cors.py)
 
 import pytest
@@ -180,20 +181,31 @@ def set_product_quantity(engine):
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def local_postgres_url() -> str | None:
-    """The DATABASE_URL from .env if it is a reachable Postgres server on this machine (conftest replaces the
-    environment's DATABASE_URL with SQLite, so .env is read directly)."""
-    url = dotenv_values(os.path.join(PROJECT_ROOT, ".env")).get("DATABASE_URL")
+@functools.lru_cache(maxsize=None)
+def postgres_test_server() -> tuple[str | None, str | None]:
+    """(url, None) when the Postgres-only tests can run, otherwise (None, why they are skipped).
+
+    Uses TEST_DATABASE_URL if it is set, else DATABASE_URL from .env (conftest replaces the environment's
+    DATABASE_URL with SQLite, so .env is read directly). Those tests create and drop scratch databases, so the
+    server must be on this machine and its user must be allowed to create databases."""
+    source = "TEST_DATABASE_URL" if os.environ.get("TEST_DATABASE_URL") else "DATABASE_URL in .env"
+    url = os.environ.get("TEST_DATABASE_URL") or dotenv_values(os.path.join(PROJECT_ROOT, ".env")).get("DATABASE_URL")
     if not url:
-        return None
+        return None, "no Postgres server configured (set DATABASE_URL in .env, or TEST_DATABASE_URL)"
     parsed = make_url(url)
-    if parsed.get_backend_name() != "postgresql" or parsed.host not in ("localhost", "127.0.0.1"):
-        return None
+    if parsed.get_backend_name() != "postgresql":
+        return None, f"{source} is not a Postgres URL"
+    if parsed.host not in ("localhost", "127.0.0.1"):
+        return None, f"{source} is not a local server; these tests create and drop databases, so they only run on localhost"
     try:
         engine = sa_create_engine(parsed.set(database="postgres"), connect_args={"connect_timeout": 3})
         with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+            can_create = conn.execute(text(
+                "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user")).scalar()
         engine.dispose()
-    except Exception:
-        return None
-    return url
+    except Exception as exc:
+        return None, f"can't connect to the Postgres server in {source} ({type(exc).__name__})"
+    if not can_create:
+        return None, (f"the database user in {source} can't create databases (it needs CREATEDB: "
+                      "ALTER ROLE <user> CREATEDB); these tests create and drop scratch databases")
+    return url, None
